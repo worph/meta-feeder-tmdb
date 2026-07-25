@@ -1,0 +1,42 @@
+[package]
+name = "card-feeder"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Card feeder sidecar: the DISCOVERY half of gateway search. Bridges metadata
+# sources (TMDB today; MyAnimeList later, as a second FeederPlugin in this same
+# binary) into `fileType=card` records — poster + description + an id bag
+# describing a WORK, never a file. It serves no bytes and never touches an
+# indexer: retrieval is a separate, second query answered by the content
+# feeders. See ../../../meta-gateway/docs/others/card-tier-search.md.
+
+[lib]
+name = "card_feeder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "card-feeder"
+path = "src/main.rs"
+
+[dependencies]
+meta-feeder-sdk = { path = "../../crates/meta-feeder-sdk" }
+
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }
