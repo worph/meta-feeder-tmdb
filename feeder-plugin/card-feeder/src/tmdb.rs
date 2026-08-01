@@ -22,7 +22,7 @@ use meta_feeder_sdk::types::{DiscoveryRecord, GatewayError, Hash, PluginHealth};
 use tracing::warn;
 
 use crate::card::{split_record_id, Card, CardSource};
-use crate::consts::DEFAULT_CARD_TOP_N;
+use crate::consts::{DEFAULT_CARD_DISCOVERY_N, DEFAULT_CARD_TOP_N};
 use crate::resolve::Resolver;
 use crate::tmdb_budget::{TmdbBudget, DEFAULT_TMDB_BURST, DEFAULT_TMDB_REFILL_PER_SEC};
 use crate::tmdb_client::TmdbClient;
@@ -39,6 +39,8 @@ pub struct TmdbConfig {
     pub tmdb_burst: Option<f64>,
     #[serde(default)]
     pub card_top_n: Option<usize>,
+    #[serde(default)]
+    pub card_discovery_n: Option<usize>,
 }
 
 impl TmdbConfig {
@@ -51,6 +53,9 @@ impl TmdbConfig {
                 .and_then(|v| v.parse().ok()),
             tmdb_burst: std::env::var("TMDB_BURST").ok().and_then(|v| v.parse().ok()),
             card_top_n: std::env::var("CARD_TOP_N").ok().and_then(|v| v.parse().ok()),
+            card_discovery_n: std::env::var("CARD_DISCOVERY_N")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 }
@@ -62,6 +67,8 @@ pub struct TmdbCardPlugin {
     /// `depends_on` is satisfied; queries just return nothing.
     resolver: Option<Resolver>,
     top_n: usize,
+    /// Cards per keyword-less catalog row (see [`DEFAULT_CARD_DISCOVERY_N`]).
+    discovery_n: usize,
     /// Test hook: `(api_base, image_base)` overriding TMDB's real endpoints, so
     /// the contract test can point the client at a wiremock server.
     api_bases: Option<(String, String)>,
@@ -79,6 +86,7 @@ impl TmdbCardPlugin {
             config: TmdbConfig::from_env(),
             resolver: None,
             top_n: DEFAULT_CARD_TOP_N,
+            discovery_n: DEFAULT_CARD_DISCOVERY_N,
             api_bases: None,
         }
     }
@@ -111,6 +119,9 @@ impl TmdbCardPlugin {
                 if file_cfg.card_top_n.is_some() {
                     self.config.card_top_n = file_cfg.card_top_n;
                 }
+                if file_cfg.card_discovery_n.is_some() {
+                    self.config.card_discovery_n = file_cfg.card_discovery_n;
+                }
             }
         }
     }
@@ -142,6 +153,11 @@ impl FeederPlugin for TmdbCardPlugin {
         self.load_config(cache_dir);
         let cache: MidhashCache = meta_feeder_sdk::common::open_midhash_cache(cache_dir, "tmdb")?;
         self.top_n = self.config.card_top_n.filter(|n| *n > 0).unwrap_or(DEFAULT_CARD_TOP_N);
+        self.discovery_n = self
+            .config
+            .card_discovery_n
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_CARD_DISCOVERY_N);
 
         let token = self.config.tmdb_token.trim().to_string();
         if token.is_empty() {
@@ -189,15 +205,33 @@ impl FeederPlugin for TmdbCardPlugin {
             self.served_file_types(),
             self.served_content_kinds(),
         ) {
+            // One misconfiguration lands here often enough to deserve a name.
+            // A browse row written against the *indexer* feeder's dialect says
+            // `contentKind:episode`, which is not in `served_content_kinds` — so
+            // the row is rejected here, before TMDB is touched, and the operator
+            // sees an empty wall with no error anywhere. A card describes a WORK,
+            // and a work is a `series`, never an `episode`.
+            if crate::discovery::is_discovery_query(query) {
+                warn!(
+                    target: "meta-share::gateway",
+                    upstream = "tmdb",
+                    content_kind = ?query.filters.get("contentKind"),
+                    "discovery row rejected by the served-kinds gate: a card is a \
+                     WORK — use contentKind:series for TV rows (not episode/tv/tvshow)"
+                );
+            }
             return Ok(Vec::new());
         }
         let Some(resolver) = self.resolver() else {
             return Ok(Vec::new()); // soft-skipped (no token)
         };
 
-        // An explicit `tmdbid:` filter resolves exactly one card — the direct
-        // "give me this work" lookup a deep link uses. Otherwise the free text
-        // goes through the principal search.
+        // Three shapes, in precedence order:
+        //   1. an explicit `tmdbid:` filter — the direct "give me this work"
+        //      lookup a deep link (or the detail page) uses;
+        //   2. a keyword-less catalog query (`popular:true contentKind:series`)
+        //      — a client's home row, answered from TMDB's catalog endpoints;
+        //   3. free text — the principal search.
         let cards: Vec<Card> = if let Some(id) = query
             .filters
             .get("tmdbid")
@@ -206,6 +240,9 @@ impl FeederPlugin for TmdbCardPlugin {
         {
             let kind = kind_hint(query, resolver, id).await;
             resolver.card_by_id(id, kind).await.into_iter().collect()
+        } else if crate::discovery::is_discovery_query(query) {
+            let n = self.discovery_n.min(max_results.max(1));
+            crate::discovery::cards_for_discovery(resolver, query, n).await
         } else {
             let free_text = query.free_text.trim();
             if free_text.is_empty() {
@@ -284,6 +321,13 @@ impl FeederPlugin for TmdbCardPlugin {
                      Blank keeps the built-in default (10). Unlike the old anchor \
                      top-N this costs no indexer requests — only TMDB.",
                 ),
+                F::number("card_discovery_n", "Cards per discovery row").with_help(
+                    "How many cards a keyword-less browse row (popular / trending / \
+                     top-rated) returns. Blank keeps the built-in default (20 — \
+                     exactly one TMDB catalog page, so a row costs ONE request). \
+                     Separate from 'Cards per search': a row is a browse surface, \
+                     not an answer to a question.",
+                ),
             ],
         }
     }
@@ -294,6 +338,7 @@ impl FeederPlugin for TmdbCardPlugin {
             "tmdb_rate_per_sec": self.config.tmdb_rate_per_sec,
             "tmdb_burst": self.config.tmdb_burst,
             "card_top_n": self.config.card_top_n,
+            "card_discovery_n": self.config.card_discovery_n,
         })
     }
 }

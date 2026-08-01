@@ -12,6 +12,7 @@
 
 pub mod card;
 pub mod consts;
+pub mod discovery;
 pub mod resolve;
 pub mod tmdb;
 pub mod tmdb_budget;

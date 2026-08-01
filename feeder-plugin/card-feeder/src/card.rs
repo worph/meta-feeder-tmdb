@@ -75,6 +75,17 @@ pub(crate) struct Card {
     pub(crate) guard_titles: Arc<Vec<String>>,
     pub(crate) overview: Option<String>,
     pub(crate) poster_path: Option<String>,
+    /// Editorial genre names (`"Animation"`, `"Drama"`, …) — METADATA_KEYS
+    /// §`genres`. The *work's* categorisation, distinct from `categories/*`,
+    /// which is the Newznab/Prowlarr distribution taxonomy a release is filed
+    /// under and which a card (having no release) never carries.
+    ///
+    /// Free on both resolution paths: a details fetch returns named genre
+    /// objects, and a list hit's bare `genre_ids` are mapped through
+    /// `Resolver::genre_names`. May be empty — TMDB genre coverage is good but
+    /// not universal, and consumers must treat "no genres" as unknown rather
+    /// than as "none".
+    pub(crate) genres: Vec<String>,
     pub(crate) year: Option<u16>,
 
     // -- structure (TV only) ------------------------------------------------
@@ -123,6 +134,27 @@ impl Card {
         n.clamp(1, MAX_CARD_SEASONS)
     }
 
+    /// The card's synopsis, trimmed and non-empty.
+    pub(crate) fn overview_text(&self) -> Option<&str> {
+        self.overview.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// The card's poster path, non-empty.
+    pub(crate) fn poster(&self) -> Option<&str> {
+        self.poster_path.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// Would this card actually render? Exactly [`Card::to_record`]'s emit
+    /// condition, hoisted so a caller can predict the drop *before* projecting.
+    ///
+    /// [`crate::discovery`] needs this: it walks catalog pages until it has N
+    /// cards, and counting raw TMDB hits would overcount — a hit with no poster
+    /// or no overview is silently declined at projection time, leaving a short
+    /// row. The two must not drift, hence one predicate rather than two.
+    pub(crate) fn is_displayable(&self) -> bool {
+        self.overview_text().is_some() && self.poster().is_some()
+    }
+
     /// Project to the wire record.
     ///
     /// Returns `None` when the card lacks a poster or a description — it would
@@ -139,8 +171,10 @@ impl Card {
         tmdb: &TmdbClient,
         query_filters: &BTreeMap<String, Vec<String>>,
     ) -> Option<DiscoveryRecord> {
-        let overview = self.overview.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
-        let poster_path = self.poster_path.as_deref().filter(|s| !s.is_empty())?;
+        // Same two conditions as `Card::is_displayable`, which the discovery page
+        // walk uses to predict this drop — keep them in one place.
+        let overview = self.overview_text()?;
+        let poster_path = self.poster()?;
 
         let mut fields: BTreeMap<String, String> = BTreeMap::new();
         // Type axes. `card` on the fileType axis and the work kind on the
@@ -170,6 +204,24 @@ impl Card {
         // Synopsis under the namespaced key meta-search indexes (not a flat
         // `overview`).
         fields.insert("description/eng".to_string(), overview.to_string());
+
+        // Genres as a KEY-SET (`genres/<Name> = "true"`), not the legacy
+        // comma-joined `genres` value the tmdb/jellyfin plugins still write.
+        //
+        // METADATA_KEYS §14.12 is explicit that `csv-set` is the shape being
+        // migrated *away* from and that "new writers must not introduce more
+        // csv-set fields — reach for key-set, even if the surrounding family is
+        // still on the legacy shape". This is a new writer, and the reason bites
+        // here specifically: a card is the one record type multiple peers derive
+        // independently at the same CID (§9.4), so two peers resolving different
+        // genre sets must union by key-merge rather than diverge into two
+        // comma-joined strings that need string-diffing to reconcile.
+        for g in &self.genres {
+            let g = g.trim();
+            if !g.is_empty() {
+                fields.insert(format!("genres/{g}"), "true".to_string());
+            }
+        }
 
         // The bare-CID key-set member, exactly as every other feeder stamps on
         // its search records (`indexer-feeder`'s `torznab/xml.rs` does the same
@@ -206,7 +258,19 @@ impl Card {
         );
 
         for (key, allowed) in query_filters {
-            if key == "languages" || fields.contains_key(key) || allowed.is_empty() {
+            // `genres` joins `languages` as an echo exclusion, for the same
+            // reason: it is stored as a key-set, so the flat field this loop
+            // would write is not the shape a reader looks for. Worse, the filter
+            // value is a *slug* (`action-adventure` — the query DSL can't spell
+            // "Action & Adventure", space being its token separator), so echoing
+            // it would persist a slug masquerading as a genre name alongside the
+            // real `genres/<Name>` members. Both re-validating tiers read the
+            // key-set, so nothing needs the echo.
+            if key == "languages"
+                || key == "genres"
+                || fields.contains_key(key)
+                || allowed.is_empty()
+            {
                 continue;
             }
             fields.insert(key.clone(), allowed.join(","));
@@ -243,6 +307,7 @@ mod tests {
             guard_titles: Arc::new(vec!["Sousou no Frieren".to_string()]),
             overview: Some("The story follows the elf mage Frieren.".to_string()),
             poster_path: Some("/dqZENchTd7lp5zit1Q7Bkjzcxpi.jpg".to_string()),
+            genres: vec!["Animation".to_string(), "Sci-Fi & Fantasy".to_string()],
             year: Some(2023),
             seasons: 1,
             season_summaries: Arc::new(Vec::new()),
@@ -326,17 +391,29 @@ mod tests {
     }
 
     /// Query filters are echoed so the record survives `record_matches` on the
-    /// way out, but `languages` is deliberately skipped (it fails open).
+    /// way out — except the two key-set fields, which a reader resolves from
+    /// their `<prefix>/<member>` members rather than from a flat value.
     #[test]
-    fn query_filters_are_echoed_except_languages() {
+    fn query_filters_are_echoed_except_the_key_set_fields() {
         let tmdb = TmdbClient::new("token".to_string());
         let mut filters = BTreeMap::new();
         filters.insert("fileType".to_string(), vec!["card".to_string()]);
-        filters.insert("genres".to_string(), vec!["fantasy".to_string()]);
+        filters.insert("popular".to_string(), vec!["true".to_string()]);
+        filters.insert("genres".to_string(), vec!["action-adventure".to_string()]);
         filters.insert("languages".to_string(), vec!["jpn".to_string()]);
         let rec = tv_card().to_record(&tmdb, &filters).expect("record");
-        assert_eq!(rec.fields["genres"], "fantasy");
+
+        assert_eq!(rec.fields["popular"], "true", "ordinary filters echo");
         assert_eq!(rec.fields["fileType"], "card", "own value wins the echo");
         assert!(!rec.fields.contains_key("languages"));
+        // The genre filter carries a *slug* the DSL can spell; echoing it would
+        // persist "action-adventure" as if it were a genre name, beside the real
+        // `genres/Action & Adventure` members.
+        assert!(
+            !rec.fields.contains_key("genres"),
+            "the genre slug must not be echoed as a flat field"
+        );
+        assert_eq!(rec.fields["genres/Animation"], "true");
+        assert_eq!(rec.fields["genres/Sci-Fi & Fantasy"], "true");
     }
 }

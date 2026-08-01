@@ -9,6 +9,7 @@
 //! The redb table names are unchanged from the indexer feeder's cache, so a
 //! warm cache carries straight over.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,9 @@ use meta_feeder_sdk::cache::MidhashCache;
 use tracing::debug;
 
 use crate::card::{Card, CardSource};
-use crate::consts::{CACHED_PRINCIPAL_DEPTH, TMDB_WAIT_DEADLINE_SECS};
+use crate::consts::{
+    CACHED_PRINCIPAL_DEPTH, TMDB_DISCOVERY_WAIT_DEADLINE_SECS, TMDB_WAIT_DEADLINE_SECS,
+};
 use crate::tmdb_budget::{Lease, TmdbBudget};
 use crate::tmdb_client::{
     principal_top_n, TmdbCall, TmdbClient, TmdbExternalIds, TmdbHit, TmdbKind, TmdbTvDetails,
@@ -28,6 +31,14 @@ pub(crate) struct Resolver {
     pub(crate) client: Arc<TmdbClient>,
     pub(crate) cache: MidhashCache,
     pub(crate) budget: Arc<TmdbBudget>,
+    /// `genre id → name` per kind, held for the process lifetime.
+    ///
+    /// In memory rather than in the redb cache on purpose: the table is 16 TV /
+    /// 19 movie entries and effectively static, so a process-local map costs one
+    /// call per kind per boot and needs no invalidation story — whereas the redb
+    /// tables are permanent-hit and shared byte-for-byte with the indexer
+    /// feeder's, which this is not part of.
+    genre_names: Arc<std::sync::RwLock<HashMap<&'static str, Arc<HashMap<u32, String>>>>>,
 }
 
 impl Resolver {
@@ -36,7 +47,44 @@ impl Resolver {
             client,
             cache,
             budget,
+            genre_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The `genre id → name` table for `kind`, fetched once and then reused.
+    ///
+    /// Needed only by the **list** paths (discovery/search), where TMDB gives
+    /// bare `genre_ids`; a details fetch returns named genre objects directly.
+    /// Best-effort: a failed or empty fetch yields an empty map (cards simply
+    /// carry no genres) and is **not** cached, so the next row retries.
+    pub(crate) async fn genre_names(&self, kind: TmdbKind) -> Arc<HashMap<u32, String>> {
+        let key = match kind {
+            TmdbKind::Tv => "tv",
+            TmdbKind::Movie => "movie",
+        };
+        if let Some(m) = self.genre_names.read().ok().and_then(|g| g.get(key).cloned()) {
+            return m;
+        }
+        let fetched: HashMap<u32, String> = self
+            .budgeted_with_deadline(
+                TMDB_DISCOVERY_WAIT_DEADLINE_SECS,
+                self.client.genre_list(kind),
+                |gs| {
+                    gs.into_iter()
+                        .filter(|g| !g.name.trim().is_empty())
+                        .map(|g| (g.id, g.name))
+                        .collect()
+                },
+            )
+            .await
+            .unwrap_or_default();
+        let arc = Arc::new(fetched);
+        if !arc.is_empty() {
+            if let Ok(mut g) = self.genre_names.write() {
+                g.insert(key, arc.clone());
+            }
+        }
+        arc
     }
 
     /// Acquire a budget token, run `call`, map a hit through `on_hit`. A 429
@@ -46,10 +94,21 @@ impl Resolver {
         call: impl std::future::Future<Output = TmdbCall<T>>,
         on_hit: impl FnOnce(T) -> R,
     ) -> Option<R> {
+        self.budgeted_with_deadline(TMDB_WAIT_DEADLINE_SECS, call, on_hit)
+            .await
+    }
+
+    /// [`Self::budgeted`] with a caller-chosen permit deadline, for callers whose
+    /// cost of waiting differs from a user-facing lookup's — see
+    /// [`TMDB_DISCOVERY_WAIT_DEADLINE_SECS`].
+    async fn budgeted_with_deadline<T, R>(
+        &self,
+        deadline_secs: u64,
+        call: impl std::future::Future<Output = TmdbCall<T>>,
+        on_hit: impl FnOnce(T) -> R,
+    ) -> Option<R> {
         if matches!(
-            self.budget
-                .acquire(Duration::from_secs(TMDB_WAIT_DEADLINE_SECS))
-                .await,
+            self.budget.acquire(Duration::from_secs(deadline_secs)).await,
             Lease::DeadlineExceeded
         ) {
             return None;
@@ -124,6 +183,29 @@ impl Resolver {
         .await
     }
 
+    /// One page of a TMDB **catalog list** (popular / trending / top-rated /
+    /// `discover`) — the keyword-less browse primitive behind
+    /// [`crate::discovery`]. `None` on a budget timeout, a 429, or a miss, which
+    /// the caller treats as "stop walking pages and keep what you have".
+    ///
+    /// Deliberately **uncached**, unlike every other method here: a catalog list
+    /// is the one TMDB response that is *supposed* to change under you, and the
+    /// redb tables in front of the others are permanent-hit caches with no TTL.
+    /// See the module doc of [`crate::discovery`] for why the repeat cost is
+    /// already absorbed a layer up.
+    pub(crate) async fn discovery_page(
+        &self,
+        kind: TmdbKind,
+        path_and_query: &str,
+    ) -> Option<Vec<TmdbHit>> {
+        self.budgeted_with_deadline(
+            TMDB_DISCOVERY_WAIT_DEADLINE_SECS,
+            self.client.discovery_list(kind, path_and_query),
+            |hits| hits,
+        )
+        .await
+    }
+
     /// Cached principal `search/multi`: free text → up to `n` confident
     /// `(tmdbid, kind)` candidates, most popular first.
     ///
@@ -194,6 +276,7 @@ impl Resolver {
                     guard_titles: Arc::new(dedup_titles(details.guard_titles())),
                     overview: details.overview.clone().filter(|s| !s.is_empty()),
                     poster_path: details.poster_path.clone().filter(|s| !s.is_empty()),
+                    genres: genre_names_of(&details.genres),
                     year,
                     seasons: Card::clamp_seasons(details.number_of_seasons),
                     season_summaries: Arc::new(details.seasons.clone()),
@@ -201,6 +284,15 @@ impl Resolver {
             }
             TmdbKind::Movie => {
                 let hit = self.movie_hit(tmdbid).await?;
+                // The movie path round-trips through `TmdbHit` (that is what the
+                // details cache stores), which keeps genres as bare ids — so
+                // unlike the TV branch above it needs the id → name table.
+                let gmap = self.genre_names(TmdbKind::Movie).await;
+                let genres: Vec<String> = hit
+                    .genre_ids
+                    .iter()
+                    .filter_map(|id| gmap.get(id).cloned())
+                    .collect();
                 let mut titles = vec![hit.title.clone()];
                 if let Some(o) = &hit.original_title {
                     titles.push(o.clone());
@@ -217,6 +309,7 @@ impl Resolver {
                     guard_titles: Arc::new(dedup_titles(titles)),
                     overview: hit.overview.filter(|s| !s.is_empty()),
                     poster_path: hit.poster_path.filter(|s| !s.is_empty()),
+                    genres,
                     year: hit.year,
                     seasons: 0,
                     season_summaries: Arc::new(Vec::new()),
@@ -244,8 +337,19 @@ impl Resolver {
     }
 }
 
+/// Genre display names off a details payload's `{id, name}` array, trimmed and
+/// de-duplicated, order preserved.
+pub(crate) fn genre_names_of(genres: &[crate::tmdb_client::TmdbGenre]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    genres
+        .iter()
+        .map(|g| g.name.trim().to_string())
+        .filter(|n| !n.is_empty() && seen.insert(n.to_lowercase()))
+        .collect()
+}
+
 /// Case-insensitive de-dup preserving first-seen order.
-fn dedup_titles(titles: Vec<String>) -> Vec<String> {
+pub(crate) fn dedup_titles(titles: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     titles
         .into_iter()

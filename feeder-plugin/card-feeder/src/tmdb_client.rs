@@ -309,6 +309,27 @@ impl TmdbClient {
         }
     }
 
+    /// `GET /3/genre/{tv,movie}/list` — the id → name table for the `genre_ids`
+    /// a discovery/search list hit carries.
+    ///
+    /// TMDB returns genres as bare ids on list responses and as `{id, name}`
+    /// objects only on a details fetch, so the *browse* path has no way to name
+    /// a genre without this table. It is tiny (16 TV / 19 movie entries) and
+    /// effectively static, which is why the caller holds it for the process
+    /// lifetime instead of paying it per row.
+    pub(crate) async fn genre_list(&self, kind: TmdbKind) -> TmdbCall<Vec<TmdbGenre>> {
+        let seg = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Tv => "tv",
+        };
+        let url = format!("{}/genre/{seg}/list", self.api_base.trim_end_matches('/'));
+        match self.get_json::<TmdbGenreList>(&url, "genre_list").await {
+            TmdbCall::Hit(r) => TmdbCall::Hit(r.genres),
+            TmdbCall::Miss => TmdbCall::Miss,
+            TmdbCall::RateLimited(d) => TmdbCall::RateLimited(d),
+        }
+    }
+
     /// Shared `GET <url>` → JSON helper with the standard bearer auth, search
     /// timeout, 429→`RateLimited`, non-2xx/transient→`Miss` contract. Factored
     /// out of [`tv_details`]/[`external_ids`]/[`movie_details`] (identical
@@ -391,6 +412,21 @@ pub(crate) fn parse_tmdb_retry_after(resp: &reqwest::Response) -> Duration {
 pub(crate) enum TmdbKind {
     Movie,
     Tv,
+}
+
+/// One `{id, name}` genre entry, as returned by `genre/{kind}/list` and by the
+/// details endpoints' `genres` array.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct TmdbGenre {
+    pub(crate) id: u32,
+    #[serde(default)]
+    pub(crate) name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TmdbGenreList {
+    #[serde(default)]
+    genres: Vec<TmdbGenre>,
 }
 
 #[derive(serde::Deserialize)]
@@ -550,6 +586,10 @@ impl TmdbHit {
 pub(crate) struct TmdbTvDetails {
     #[serde(default)]
     pub(crate) number_of_seasons: u32,
+    /// Genre objects (`{id, name}`) — present on a details fetch, unlike the
+    /// bare `genre_ids` a list response carries. Free here: same payload.
+    #[serde(default)]
+    pub(crate) genres: Vec<TmdbGenre>,
     /// One entry per season TMDB knows about, including season 0
     /// ("Specials"). `episode_count` is the released-episode total.
     #[serde(default)]
@@ -691,6 +731,9 @@ pub(crate) struct TmdbExternalIds {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct TmdbMovieDetails {
     pub(crate) id: u64,
+    /// See [`TmdbTvDetails::genres`].
+    #[serde(default)]
+    pub(crate) genres: Vec<TmdbGenre>,
     #[serde(default)]
     pub(crate) title: Option<String>,
     #[serde(default)]
