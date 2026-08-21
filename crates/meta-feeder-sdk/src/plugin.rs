@@ -74,6 +74,13 @@ pub struct HashOutcome {
 ///   digest is over the id set, not over any block, so the `.nzb` manifest
 ///   travels separately as an ordinary sha2-256 cid in the record's `manifest`
 ///   field. Produced by `hash::compute_nzb_posting_cid`.
+/// - `YtVideo` — a **delegated-playback** reference, custom multicodec
+///   `yt-video` `0x1008`. Like `CardLocator` it is always paired with
+///   `bytes: None` and lands in the `(None, Some)` metadata-only branch, but it
+///   means something stronger than "no bytes yet": the bytes **exist and are
+///   permanently someone else's**. Nothing is fetched, seeded or
+///   content-addressed, and meta-share's byte path REFUSES the cid with a `400`
+///   rather than 404ing. Produced by `hash::compute_yt_video_cid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashKind {
     /// Reserved: no feeder currently emits midhash256 outcomes, but the family
@@ -85,6 +92,7 @@ pub enum HashKind {
     NzbRelease,
     CardLocator,
     NzbPosting,
+    YtVideo,
 }
 
 /// Startup-only configuration error returned by [`FeederPlugin::configure`].

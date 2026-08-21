@@ -298,6 +298,117 @@ pub fn compute_card_cid(source: &str, id: &str) -> Option<String> {
     Some(format!("b{}", base32_lower_no_padding(&wire)))
 }
 
+// ---------------------------------------------------------------------------
+// Delegated-playback locators — `yt-video` (0x1008) and `ext-play` (0x1009)
+// ---------------------------------------------------------------------------
+//
+// These two are the limit case *beyond* `card` (0x1007). `card` addresses a
+// work with no bytes anywhere; these address a **rendition whose bytes exist
+// but are permanently someone else's**. An external player renders the media,
+// nothing is transported, nothing is content-addressed, nothing is re-seedable.
+//
+// See `docs/cid-formats.md` §7 and
+// `docs/study/listenbrainz-youtube-playback-tier-2026-08-21.md`.
+
+/// Custom multicodec for a **YouTube rendition** — delegated playback.
+///
+/// Its own codec rather than a `url` (`0x1006`) for three reasons, in
+/// descending order of how much trouble the alternative causes:
+///
+/// * **`0x1006` means "fetch these bytes once and seed them".** Point a `url`
+///   locator at a `watch` page and meta-share does exactly that: fetches the
+///   HTML, chunks it, seeds it, and links the resulting content CID back onto
+///   the record *as the file*. That is the MSR1 poisoning shape, except
+///   permanent and replicated across peers. A resolved `googlevideo` URL is no
+///   better — time-limited and IP-bound, so it is not a locator at all.
+/// * **The id is canonical, a URL is not.** `youtube.com` / `music.youtube.com`
+///   / `youtu.be` all address the same video, and query parameters are tracking
+///   noise, so the same rendition would mint several different CIDs. Being a
+///   pure function of `(kind, id)`, this codec makes two peers that resolve the
+///   same track converge on one meta-core record for free, via the
+///   `cids/<bareCid>` reverse index — the property that makes [`compute_card_cid`]
+///   useful, for the same reason.
+/// * **It is tiny** — 11 bytes of id plus a short kind prefix.
+///
+/// ⚠ **An immutable id is not durable playback.** Takedowns, geo-blocks and
+/// embed-disabled uploads all kill a reference whose CID stays valid forever —
+/// the same rot class as [`NZB_RELEASE_CODEC`]. The mitigation is at the
+/// *record* level (carry several ranked references per recording so a client
+/// can fall through), never at the CID level.
+pub const YT_VIDEO_CODEC: u64 = 0x1008;
+
+/// Custom multicodec for an **external page to open, never fetch**.
+///
+/// Wire-identical to `url` (`0x1006`) apart from the codec, and that difference
+/// is the entire contract: `0x1006` resolves cache-through and lands in the
+/// blockstore, `0x1009` **must be refused by the byte path** and only ever
+/// surfaces as an "Open on …↗" affordance. Use it for anything worth linking
+/// but not worth a per-provider codec (Bandcamp, Jamendo, an arbitrary stream
+/// page).
+pub const EXT_PLAY_CODEC: u64 = 0x1009;
+
+/// Encode a [`YT_VIDEO_CODEC`] locator from a `kind` and a bare YouTube id.
+///
+/// `kind` is `"video"` | `"playlist"` | `"channel"`; `id` is the bare
+/// identifier (`4D7u5KF7SP8`, `OLAK5uy_…`, `UCRr1xG_2WIDs18a6cIiCxeA`) — **not**
+/// a URL, and not a `watch?v=` fragment. The framing is byte-identical to
+/// [`compute_card_cid`] on purpose, so each of the seven rank/decode
+/// implementations extends a parser it already wrote rather than learning a
+/// novel shape.
+///
+/// Returns `None` on an empty field or a digest past the multihash budget —
+/// the caller drops that reference.
+pub fn compute_yt_video_cid(kind: &str, id: &str) -> Option<String> {
+    kinded_locator_cid(YT_VIDEO_CODEC, kind, id)
+}
+
+/// Encode an [`EXT_PLAY_CODEC`] locator from an `http(s)` URL.
+///
+/// The scheme check is not cosmetic: it is what keeps a `javascript:` or
+/// `data:` payload from ever reaching a client that will hand this string to
+/// an anchor or a new tab.
+pub fn compute_ext_play_cid(url: &str) -> Option<String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let digest = url.as_bytes();
+    if digest.is_empty() || digest.len() > CARD_LOCATOR_MAX_DIGEST {
+        return None;
+    }
+    Some(identity_locator_cid(EXT_PLAY_CODEC, digest))
+}
+
+/// Shared encoder for the `varint(len(kind)) ‖ kind ‖ id` locator framing used
+/// by [`compute_card_cid`] and [`compute_yt_video_cid`].
+fn kinded_locator_cid(codec: u64, kind: &str, id: &str) -> Option<String> {
+    if kind.is_empty() || id.is_empty() {
+        return None;
+    }
+    let kind_b = kind.as_bytes();
+    let id_b = id.as_bytes();
+
+    let mut digest = Vec::with_capacity(2 + kind_b.len() + id_b.len());
+    write_pb_varint(kind_b.len() as u64, &mut digest);
+    digest.extend_from_slice(kind_b);
+    digest.extend_from_slice(id_b);
+    if digest.len() > CARD_LOCATOR_MAX_DIGEST {
+        return None;
+    }
+    Some(identity_locator_cid(codec, &digest))
+}
+
+/// CIDv1 with an *identity* multihash:
+/// `[version=0x01][codec varint][mh=0x00][len varint][digest]`, base32lower.
+fn identity_locator_cid(codec: u64, digest: &[u8]) -> String {
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01);
+    write_pb_varint(codec, &mut wire);
+    wire.push(0x00); // multihash code: identity
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(digest);
+    format!("b{}", base32_lower_no_padding(&wire))
+}
+
 /// Custom multicodec for a **Usenet posting** identity (`nzb-posting`),
 /// minted from the article Message-IDs of a release we scanned ourselves.
 ///
@@ -670,6 +781,82 @@ mod tests {
         assert_eq!(base32_lower_no_padding(b"foo"), "mzxw6");
         assert_eq!(base32_lower_no_padding(b"foob"), "mzxw6yq");
         assert_eq!(base32_lower_no_padding(b"foobar"), "mzxw6ytboi");
+    }
+
+    #[test]
+    fn yt_video_cid_matches_golden_vector() {
+        // Pinned by `/cid-rank-vectors.json`'s `yt-video-locator` entry. The id
+        // is the real resolver output for Daft Punk / "Get Lucky" measured in
+        // the delegated-playback study §4.3.
+        assert_eq!(
+            compute_yt_video_cid("video", "4D7u5KF7SP8").unwrap(),
+            "bagecaaarav3gszdfn42ein3vgvfumn2tka4a"
+        );
+    }
+
+    #[test]
+    fn yt_video_cid_framing_matches_card_locator() {
+        // The two codecs share the `varint(len(kind)) || kind || id` framing on
+        // purpose, so every decoder extends a parser it already wrote. If this
+        // ever fails, the two shapes have drifted and §7.2 of docs/cid-formats.md
+        // is no longer true.
+        let yt = compute_yt_video_cid("tmdb", "tv:95479").unwrap();
+        let card = compute_card_cid("tmdb", "tv:95479").unwrap();
+        // Same digest, different codec => same length, differing only in the
+        // codec varint region.
+        assert_ne!(yt, card);
+        assert_eq!(yt.len(), card.len());
+    }
+
+    #[test]
+    fn yt_video_cid_is_a_pure_function_of_kind_and_id() {
+        // Convergence is the reason this is a codec and not a URL: two peers
+        // that resolve the same video must derive the same address offline.
+        assert_eq!(
+            compute_yt_video_cid("video", "4D7u5KF7SP8"),
+            compute_yt_video_cid("video", "4D7u5KF7SP8")
+        );
+        // ...and the kind is part of the identity, not decoration.
+        assert_ne!(
+            compute_yt_video_cid("video", "OLAK5uy_kZ8Xq"),
+            compute_yt_video_cid("playlist", "OLAK5uy_kZ8Xq")
+        );
+    }
+
+    #[test]
+    fn yt_video_cid_rejects_empty_fields() {
+        assert!(compute_yt_video_cid("", "4D7u5KF7SP8").is_none());
+        assert!(compute_yt_video_cid("video", "").is_none());
+    }
+
+    #[test]
+    fn ext_play_cid_matches_golden_vector() {
+        assert_eq!(
+            compute_ext_play_cid("https://example.bandcamp.com/album/x").unwrap(),
+            "bagesaabenb2hi4dthixs6zlymfwxa3dffzrgc3temnqw24bomnxw2l3bnrrhk3jppa"
+        );
+    }
+
+    #[test]
+    fn ext_play_cid_rejects_non_http_schemes() {
+        // Load-bearing: a client hands this string to an anchor or a new tab,
+        // so a `javascript:` or `data:` payload must never mint a locator.
+        assert!(compute_ext_play_cid("javascript:alert(1)").is_none());
+        assert!(compute_ext_play_cid("data:text/html,<script>").is_none());
+        assert!(compute_ext_play_cid("ftp://example.com/x").is_none());
+        assert!(compute_ext_play_cid("").is_none());
+    }
+
+    #[test]
+    fn ext_play_cid_differs_from_the_url_locator_for_the_same_url() {
+        // The whole contract lives in the codec slot: `0x1006` means "fetch and
+        // seed these bytes", `0x1009` means "open this, there are no bytes for
+        // us". Wire-identical otherwise — which is exactly why a decoder that
+        // matched on *shape* would seed a Bandcamp page as the file.
+        let url = "https://example.bandcamp.com/album/x";
+        let ext = compute_ext_play_cid(url).unwrap();
+        let card = compute_card_cid("x", url).unwrap();
+        assert_ne!(ext, card);
     }
 
     #[test]

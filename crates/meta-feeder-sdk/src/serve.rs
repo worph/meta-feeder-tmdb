@@ -57,6 +57,7 @@ pub enum HashKindDto {
     NzbRelease,
     CardLocator,
     NzbPosting,
+    YtVideo,
 }
 
 impl From<HashKind> for HashKindDto {
@@ -68,6 +69,7 @@ impl From<HashKind> for HashKindDto {
             HashKind::NzbRelease => HashKindDto::NzbRelease,
             HashKind::CardLocator => HashKindDto::CardLocator,
             HashKind::NzbPosting => HashKindDto::NzbPosting,
+            HashKind::YtVideo => HashKindDto::YtVideo,
         }
     }
 }
@@ -81,6 +83,7 @@ impl From<HashKindDto> for HashKind {
             HashKindDto::NzbRelease => HashKind::NzbRelease,
             HashKindDto::CardLocator => HashKind::CardLocator,
             HashKindDto::NzbPosting => HashKind::NzbPosting,
+            HashKindDto::YtVideo => HashKind::YtVideo,
         }
     }
 }
