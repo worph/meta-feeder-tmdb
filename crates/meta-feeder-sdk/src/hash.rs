@@ -183,9 +183,9 @@ const NZB_RELEASE_MAX_DIGEST: usize = 64;
 ///
 /// Returns `None` when the id isn't hex or the digest would overflow the
 /// multihash budget (an oversized host) — the caller drops that row.
-pub fn compute_nzb_release_cid(host: &str, release_id: &str) -> Option<String> {
+pub fn compute_nzb_release_cid(api_base: &str, release_id: &str) -> Option<String> {
     let id_bytes = decode_hex_id(release_id)?;
-    let host_b = host.as_bytes();
+    let host_b = api_base.as_bytes();
 
     // identity-multihash digest = varint(host_len) ‖ host ‖ id_bytes
     let mut digest = Vec::with_capacity(2 + host_b.len() + id_bytes.len());

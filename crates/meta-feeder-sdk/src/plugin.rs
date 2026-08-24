@@ -129,6 +129,33 @@ pub fn upstream_id_field(upstream_id: &str) -> String {
     format!("{upstream_id}id")
 }
 
+/// Key-set prefix for the provenance `source/<label>` field (METADATA_KEYS §5).
+/// Each member is its own hash field (`source/gateway:nyaa.si = "true"`) so two
+/// producers that reach the same content by different routes union without a
+/// last-writer-wins clobber. The `<label>` uses `:` internally (not `/`, which
+/// is the key-set path separator) — e.g. `gateway:nyaa.si`, `gateway:tribler`.
+pub const SOURCE_KEYSET_PREFIX: &str = "source/";
+
+/// Stamp the SDK's default provenance member — `source/gateway:<upstream_id>` —
+/// onto a record's fields, but **only if it carries no `source/*` member yet**.
+/// This gives every gateway hit a provenance label for free (so meta-watch never
+/// falls back to "unknown" for a feeder record), while a plugin that knows a
+/// finer origin (torznab → the specific Prowlarr indexer) stamps its own flat
+/// `source/*` facets first (`source/gateway`, `source/<protocol>`,
+/// `source/<indexer-slug>`) and this default then no-ops.
+pub fn stamp_default_source(
+    fields: &mut std::collections::BTreeMap<String, String>,
+    upstream_id: &str,
+) {
+    if fields.keys().any(|k| k.starts_with(SOURCE_KEYSET_PREFIX)) {
+        return;
+    }
+    fields.insert(
+        format!("{SOURCE_KEYSET_PREFIX}gateway:{upstream_id}"),
+        "true".to_string(),
+    );
+}
+
 /// Static plugin contract. Each enabled `upstream_id` is implemented by
 /// exactly one `Box<dyn FeederPlugin>`. Lives behind `&self` in steady state —
 /// called concurrently, owns any interior mutability for caches.
