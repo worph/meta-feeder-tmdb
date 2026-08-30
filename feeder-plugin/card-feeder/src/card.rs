@@ -181,7 +181,14 @@ impl Card {
         // contentKind axis stay orthogonal, so `fileType:card contentKind:series`
         // is a well-formed query and routing needs no special case.
         fields.insert("fileType".to_string(), "card".to_string());
-        fields.insert("contentKind".to_string(), self.content_kind().to_string());
+        let content_kind = self.content_kind();
+        fields.insert("contentKind".to_string(), content_kind.to_string());
+        // Third axis: which app the card is destined for. `fileType=card` says
+        // "no bytes", `contentKind` says which work, `domain` says who wants it
+        // — meta-watch's wall is a `domain:film|tv` query (METADATA_KEYS.md §1).
+        if let Some(domain) = meta_feeder_sdk::domain::domain_for_content_kind(content_kind) {
+            fields.insert("domain".to_string(), domain.to_string());
+        }
         fields.insert("title".to_string(), self.title.clone());
 
         // The id bag.
