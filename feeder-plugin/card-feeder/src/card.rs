@@ -183,11 +183,19 @@ impl Card {
         fields.insert("fileType".to_string(), "card".to_string());
         let content_kind = self.content_kind();
         fields.insert("contentKind".to_string(), content_kind.to_string());
-        // Third axis: which app the card is destined for. `fileType=card` says
-        // "no bytes", `contentKind` says which work, `domain` says who wants it
-        // — meta-watch's wall is a `domain:film|tv` query (METADATA_KEYS.md §1).
+        // Third and fourth axes: which app the card is destined for, and what
+        // shape of work it is. `fileType=card` says "no bytes", `contentKind`
+        // says which work, `domain` says who wants it — meta-watch's wall is a
+        // `domain:screen` query — and `workForm` says film-or-serial, the split
+        // `domain` stopped carrying when film and tv merged (METADATA_KEYS.md
+        // §1, §14.17).
         if let Some(domain) = meta_feeder_sdk::domain::domain_for_content_kind(content_kind) {
             fields.insert("domain".to_string(), domain.to_string());
+        }
+        if let Some(work_form) =
+            meta_feeder_sdk::domain::work_form_for_content_kind(content_kind)
+        {
+            fields.insert("workForm".to_string(), work_form.to_string());
         }
         fields.insert("title".to_string(), self.title.clone());
 
