@@ -64,7 +64,7 @@ fn tv_details_json() -> serde_json::Value {
         "poster_path": "/poster.jpg",
         "number_of_seasons": 1,
         "seasons": [{"season_number": 1, "episode_count": 28}],
-        "alternative_titles": { "results": [{"title": "Sousou no Frieren"}] }
+        "alternative_titles": { "results": [{"iso_3166_1": "JP", "title": "Sousou no Frieren"}] }
     })
 }
 
@@ -148,6 +148,15 @@ async fn query_returns_a_card_with_both_axes_and_the_id_bag() {
     assert_eq!(f["fileType"], "card");
     assert_eq!(f["contentKind"], "series");
     assert_eq!(f["title"], "Frieren: Beyond Journey's End");
+    // Every name as the language-nested key-set: original (ja), the en-US
+    // title, and the JP-market AKA.
+    for key in [
+        "titles/jpn/\u{845}\u{9001}\u{306e}\u{30d5}\u{30ea}\u{30fc}\u{30ec}\u{30f3}",
+        "titles/eng/Frieren: Beyond Journey's End",
+        "titles/jpn/Sousou no Frieren",
+    ] {
+        assert_eq!(f.get(key).map(String::as_str), Some("true"), "{key}");
+    }
     // The id bag — phase 2 selects from this rather than assuming `tmdbid`.
     assert_eq!(f["tmdbid"], "95479");
     assert_eq!(f["tvdbid"], "367189");

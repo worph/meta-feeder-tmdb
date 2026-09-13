@@ -409,6 +409,27 @@ fn identity_locator_cid(codec: u64, digest: &[u8]) -> String {
     format!("b{}", base32_lower_no_padding(&wire))
 }
 
+/// Custom multicodec for the **url-locator** family: a CID whose bytes are an
+/// `http(s)` URL rather than a hash of the file (METADATA_KEYS.md §2.1), so a
+/// record references external bytes without carrying a raw URL field.
+///
+/// Copied from the git `meta-feeder-sdk` (`hash.rs`, present since v1.1.0),
+/// which this vendored copy predates. Keep the two byte-identical.
+pub const URL_LOCATOR_CODEC: u64 = 0x1006;
+
+/// Encode an `http(s)` URL as a `0x1006` identity-multihash CIDv1. The digest
+/// *is* the URL, so minting one costs no I/O.
+///
+/// `None` for anything that is not an absolute http(s) URL — a relative value
+/// would encode fine and then fail unresolvably at render time.
+pub fn compute_url_cid(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    Some(identity_locator_cid(URL_LOCATOR_CODEC, url.as_bytes()))
+}
+
 /// Custom multicodec for a **Usenet posting** identity (`nzb-posting`),
 /// minted from the article Message-IDs of a release we scanned ourselves.
 ///
@@ -645,6 +666,26 @@ pub(crate) fn base32_lower_no_padding(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pinned against an independent encoder. The tmdb plugin's TS
+    /// `encodeUrlCid` asserts the same strings, so a drift on either side fails.
+    /// The long URL exercises the two-byte length varint (> 127 bytes).
+    #[test]
+    fn url_cid_matches_pinned_vectors() {
+        assert_eq!(
+            compute_url_cid("https://image.tmdb.org/t/p/w500/dqZENchTd7lp5zit1Q7Bkjzcxpi.jpg")
+                .as_deref(),
+            Some("bagdcaab7nb2hi4dthixs62lnmftwkltunvsgeltpojts65bpoaxxonjqgaxwi4k2ivhgg2cumq3wy4bvpjuximkrg5bgw2t2mn4ha2jonjygo")
+        );
+        let long = format!("https://image.tmdb.org/t/p/w500/{}.jpg", "a".repeat(100));
+        assert_eq!(long.len(), 136);
+        assert_eq!(
+            compute_url_cid(&long).as_deref(),
+            Some("bagdcaaeiafuhi5dqom5c6l3jnvqwozjoorwwiyron5zgol3uf5yc65zvgayc6ylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcylbmfqwcltkobtq")
+        );
+        assert!(compute_url_cid("/relative.jpg").is_none());
+        assert!(compute_url_cid("ftp://example.com/x.jpg").is_none());
+    }
 
     #[test]
     fn midhash256_matches_ts_fixtures() {

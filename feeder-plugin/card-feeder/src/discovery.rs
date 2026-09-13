@@ -60,7 +60,7 @@ use tracing::debug;
 use crate::card::{Card, CardSource};
 use crate::consts::{DISCOVERY_EXCLUDED_KEYWORDS, DISCOVERY_MAX_PAGES, DISCOVERY_MIN_VOTES};
 use crate::resolve::{dedup_titles, Resolver};
-use crate::tmdb_client::{TmdbHit, TmdbKind};
+use crate::tmdb_client::{title_names, TmdbHit, TmdbKind};
 
 /// TMDB keyword id for "anime". `/discover` is the only catalog endpoint that
 /// takes a keyword filter, which is why `anime:true` switches endpoints rather
@@ -300,6 +300,14 @@ fn card_from_hit(hit: &TmdbHit, kind: TmdbKind, genres: &HashMap<u32, String>) -
         imdb_id: None,
         title: hit.title.clone(),
         guard_titles: Arc::new(dedup_titles(titles)),
+        // A list hit carries no AKAs, so this is title + original only; the
+        // click-time `card_by_id` card adds the AKAs under the same CID.
+        names: title_names(
+            &hit.title,
+            hit.original_title.as_deref(),
+            hit.original_language.as_deref(),
+            &hit.akas,
+        ),
         overview: hit.overview.clone().filter(|s| !s.trim().is_empty()),
         poster_path: hit.poster_path.clone().filter(|s| !s.trim().is_empty()),
         // A list hit carries bare genre ids; the table names them.
@@ -309,6 +317,10 @@ fn card_from_hit(hit: &TmdbHit, kind: TmdbKind, genres: &HashMap<u32, String>) -
         // omitted from the record (`Card::to_record` skips it at `seasons == 0`).
         seasons: 0,
         season_summaries: Arc::new(Vec::new()),
+        // A list response carries no `images` append, so a discovery card files
+        // no `posters/*` set; the click-time `card_by_id` card adds it under the
+        // same CID.
+        posters: Arc::new(Vec::new()),
     }
 }
 
@@ -592,6 +604,7 @@ mod tests {
 
     fn hit() -> TmdbHit {
         TmdbHit {
+            akas: Vec::new(),
             tmdbid: 95479,
             title: "Frieren: Beyond Journey's End".to_string(),
             original_title: Some("葬送のフリーレン".to_string()),
@@ -601,6 +614,7 @@ mod tests {
             poster_path: Some("/poster.jpg".to_string()),
             genre_ids: vec![16],
             alt_titles: Vec::new(),
+            posters: Vec::new(),
         }
     }
 

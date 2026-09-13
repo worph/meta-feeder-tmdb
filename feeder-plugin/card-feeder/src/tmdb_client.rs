@@ -190,7 +190,7 @@ impl TmdbClient {
     /// any failure returns `None` so validation degrades to "accept".
     pub(crate) async fn tv_details(&self, tmdbid: u64) -> TmdbCall<TmdbTvDetails> {
         let url = format!(
-            "{}/tv/{}?append_to_response=alternative_titles",
+            "{}/tv/{}?append_to_response=alternative_titles,images",
             self.api_base.trim_end_matches('/'),
             tmdbid,
         );
@@ -253,7 +253,7 @@ impl TmdbClient {
     /// [`tv_details`].
     pub(crate) async fn movie_details(&self, tmdbid: u64) -> TmdbCall<TmdbMovieDetails> {
         let url = format!(
-            "{}/movie/{}?append_to_response=alternative_titles",
+            "{}/movie/{}?append_to_response=alternative_titles,images",
             self.api_base.trim_end_matches('/'),
             tmdbid
         );
@@ -457,8 +457,8 @@ pub(crate) struct TmdbSearchItem {
     #[serde(default)]
     pub(crate) genre_ids: Vec<u32>,
     /// ISO 639-1 (2-letter) language the title was originally produced in.
-    /// Mapped to `lang3` and used to file `original_title` under
-    /// `titles/{lang3}` (METADATA_KEYS.md §3).
+    /// Mapped to `lang3` and used to file `original_title` as a
+    /// `titles/{lang3}/{name}` member (METADATA_KEYS.md §3).
     #[serde(default)]
     pub(crate) original_language: Option<String>,
 }
@@ -493,6 +493,8 @@ impl TmdbSearchItem {
             genre_ids: self.genre_ids,
             // search-list items carry no AKAs (a details/append fetch does)
             alt_titles: Vec::new(),
+            akas: Vec::new(),
+            posters: Vec::new(),
         }
     }
 }
@@ -500,8 +502,8 @@ impl TmdbSearchItem {
 /// Map an ISO 639-1 (2-letter) code to its ISO 639-3 (`lang3`) equivalent,
 /// matching the store's convention (`eng`, `jpn`, `fra`; the 639-2/T variant
 /// where B/T differ, e.g. `deu` not `ger`). Covers the languages TMDB
-/// commonly returns; unknown codes return `None` so the caller skips the
-/// `titles/{lang3}` write rather than persisting a non-`lang3` key.
+/// commonly returns; unknown codes return `None` so the caller files the name under `und`
+/// rather than persisting a non-`lang3` key.
 pub(crate) fn iso639_1_to_3(code: &str) -> Option<&'static str> {
     Some(match code.to_ascii_lowercase().as_str() {
         "en" => "eng",
@@ -541,6 +543,113 @@ pub(crate) fn iso639_1_to_3(code: &str) -> Option<&'static str> {
     })
 }
 
+/// The language TMDB's `name`/`title` is written in. Every request goes out
+/// without a `language` param, so TMDB answers in its default, en-US.
+pub(crate) const METADATA_LANG3: &str = "eng";
+
+/// A title as a `titles/{lang3}/{name}` member name (METADATA_KEYS.md): trimmed,
+/// internal whitespace collapsed to one space, case/diacritics/`%` verbatim.
+/// The `/` → `∕` mapping is the key's job ([`title_member_key`]), not the name's.
+pub(crate) fn normalize_title_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The `titles/{lang3}/{name}` key-set member for `name`, or `None` when the
+/// name normalises to empty. `/` is the key-set separator, so a `/` inside a
+/// name (`Fate/Zero`) is written as U+2215 `∕` (METADATA_KEYS.md).
+///
+/// CROSS-BINARY CONTRACT: the indexer feeder's `tmdb.rs::title_member_key`
+/// writes the same shape; two peers must produce the same key for one name.
+pub(crate) fn title_member_key(lang3: &str, name: &str) -> Option<String> {
+    let name = normalize_title_name(name);
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("titles/{lang3}/{}", name.replace('/', "\u{2215}")))
+}
+
+/// The language a TMDB AKA market (`iso_3166_1`) clearly implies, or `und` for
+/// a multilingual or unknown market (METADATA_KEYS.md `titles/{lang3}/{name}`:
+/// map what is unambiguous, never guess). `CA`, `CH`, `BE`, `IN`, `HK`, `SG`,
+/// empty, … are `und` on purpose.
+pub(crate) fn market_lang3(market: &str) -> &'static str {
+    match market.trim().to_ascii_uppercase().as_str() {
+        "US" | "GB" | "AU" | "NZ" | "IE" => "eng",
+        "FR" => "fra",
+        "DE" | "AT" => "deu",
+        "ES" | "MX" | "AR" | "CO" | "CL" | "PE" | "VE" | "UY" => "spa",
+        "BR" | "PT" => "por",
+        "IT" => "ita",
+        "JP" => "jpn",
+        "KR" => "kor",
+        "CN" | "TW" => "zho",
+        "RU" => "rus",
+        "UA" => "ukr",
+        "PL" => "pol",
+        "NL" => "nld",
+        "SE" => "swe",
+        "NO" => "nor",
+        "DK" => "dan",
+        "FI" => "fin",
+        "TR" => "tur",
+        "GR" => "ell",
+        "HU" => "hun",
+        "CZ" => "ces",
+        "SK" => "slk",
+        "RO" => "ron",
+        "BG" => "bul",
+        "RS" => "srp",
+        "HR" => "hrv",
+        "IL" => "heb",
+        "IR" => "fas",
+        "TH" => "tha",
+        "VN" => "vie",
+        "ID" => "ind",
+        _ => "und",
+    }
+}
+
+/// Every name of a work as `(lang3, name)` — what the card files under
+/// `titles/{lang3}/{name}`:
+///
+/// - `original` under its `original_language` (`und` when unmapped/absent);
+/// - `title` under [`METADATA_LANG3`], **unless it equals the original** — TMDB
+///   falls back to the original name when it has no en-US translation, so `3%`
+///   is filed once, as `titles/por/3%`, not also as an English name;
+/// - every AKA under the language its market implies ([`market_lang3`]).
+///
+/// Names are normalised ([`normalize_title_name`]); blanks, TMDB's
+/// `(untitled)` placeholder and exact `(lang3, name)` repeats are dropped.
+pub(crate) fn title_names(
+    title: &str,
+    original: Option<&str>,
+    original_language: Option<&str>,
+    akas: &[TmdbAltTitle],
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut push = |lang3: &'static str, name: &str| {
+        let name = normalize_title_name(name);
+        if !name.is_empty() && !out.iter().any(|(l, n)| *l == lang3 && *n == name) {
+            out.push((lang3, name));
+        }
+    };
+    let original = original.map(normalize_title_name).filter(|o| !o.is_empty());
+    if let Some(o) = &original {
+        let lang3 = original_language
+            .and_then(|l| iso639_1_to_3(l.trim()))
+            .unwrap_or("und");
+        push(lang3, o);
+    }
+    let title = normalize_title_name(title);
+    if title != "(untitled)" && original.as_deref() != Some(title.as_str()) {
+        push(METADATA_LANG3, &title);
+    }
+    for aka in akas {
+        push(market_lang3(&aka.iso_3166_1), &aka.title);
+    }
+    out
+}
+
 // `Clone` is required so the single-flight `Shared` future (whose `Output`
 // must be `Clone`) can hand the same hit to every coalesced caller; serde so
 // hits persist in the redb TMDB-search cache.
@@ -566,15 +675,51 @@ pub(crate) struct TmdbHit {
     /// Empty for hits built from a search list (which carries no AKAs).
     #[serde(default)]
     pub(crate) alt_titles: Vec<String>,
+    /// The same AKAs **with their market**, which the card needs to file each
+    /// under `titles/{lang3}/{name}` ([`title_names`]). Empty on a movie-details
+    /// cache entry written before it existed — `Resolver::movie_hit` refetches
+    /// those once.
+    #[serde(default)]
+    pub(crate) akas: Vec<TmdbAltTitle>,
+    /// Poster candidates from the details `images` append, filed by the card as
+    /// `posters/{lang3}/{cid}` (METADATA_KEYS.md §6). Empty for list hits and for
+    /// a movie-details cache entry written before it existed — deliberately NOT a
+    /// self-heal trigger in `Resolver::movie_hit`: no backfill, no TMDB budget.
+    #[serde(default)]
+    pub(crate) posters: Vec<TmdbImage>,
 }
 
 impl TmdbHit {
     /// TMDB `original_language` (ISO 639-1) mapped to the store's `lang3`
     /// (ISO 639-3), or `None` when the language is outside the common set or
-    /// absent. Used to file `original_title` under `titles/{lang3}` (§3).
+    /// absent. Used to file `original_title` under `titles/{lang3}/{name}` (§3).
     pub(crate) fn original_lang3(&self) -> Option<&'static str> {
         iso639_1_to_3(self.original_language.as_deref()?.trim())
     }
+}
+
+/// One poster from a details payload's `images` append — a candidate for the
+/// card's `posters/{lang3}/{cid}` key-set ([`crate::card::poster_member_keys`]).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TmdbImage {
+    #[serde(default)]
+    pub(crate) file_path: String,
+    /// Language of the text printed on the poster (ISO 639-1); `None` = textless.
+    #[serde(default)]
+    pub(crate) iso_639_1: Option<String>,
+    #[serde(default)]
+    pub(crate) vote_average: f64,
+    #[serde(default)]
+    pub(crate) vote_count: u32,
+}
+
+/// The `images` object `?append_to_response=images` adds to `GET /3/{tv,movie}/{id}`.
+/// Only `posters` is decoded. No `language` param is sent, so TMDB returns the
+/// posters of every language.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TmdbImages {
+    #[serde(default)]
+    pub(crate) posters: Vec<TmdbImage>,
 }
 
 /// Authoritative TV structure from `GET /3/tv/{id}`, used to bounds-check
@@ -617,6 +762,10 @@ pub(crate) struct TmdbTvDetails {
     /// fetch self-heals with one refetch (same pattern as the display fields).
     #[serde(default)]
     pub(crate) alternative_titles: Option<TmdbAltTitles>,
+    /// Poster candidates from `?append_to_response=images`. `None` on a cache
+    /// entry written before the append — NOT a self-heal trigger (no backfill).
+    #[serde(default)]
+    pub(crate) images: Option<TmdbImages>,
 }
 
 impl TmdbTvDetails {
@@ -630,8 +779,15 @@ impl TmdbTvDetails {
     /// True when the AKA field was populated by the current (append-enabled)
     /// decoder. A `false` on a cache hit means a pre-AKA entry → the cached
     /// fetch refetches once to upgrade it (mirrors [`has_display`]).
+    ///
+    /// Also `false` for an AKA list decoded before `iso_3166_1` was: the
+    /// search-term pick (`card::search_aka`) prefers English-market AKAs, and a
+    /// market-less list would silently keep TMDB's order (`3 Pourcent` over
+    /// `3 percent`) forever. One refetch per such entry upgrades it.
     pub(crate) fn has_akas(&self) -> bool {
-        self.alternative_titles.is_some()
+        self.alternative_titles
+            .as_ref()
+            .is_some_and(TmdbAltTitles::has_markets)
     }
 
     /// The show's canonical + original + AKA titles, for the id-based-job
@@ -672,6 +828,16 @@ impl TmdbTvDetails {
                 .as_ref()
                 .map(TmdbAltTitles::all)
                 .unwrap_or_default(),
+            akas: self
+                .alternative_titles
+                .as_ref()
+                .map(TmdbAltTitles::entries)
+                .unwrap_or_default(),
+            posters: self
+                .images
+                .as_ref()
+                .map(|i| i.posters.clone())
+                .unwrap_or_default(),
         })
     }
 }
@@ -699,17 +865,42 @@ pub(crate) struct TmdbAltTitles {
 pub(crate) struct TmdbAltTitle {
     #[serde(default)]
     pub(crate) title: String,
+    /// The market the AKA is used in (`US`, `FR`, …). Empty on a cache entry
+    /// written before it was decoded — ordering then falls back to TMDB's.
+    #[serde(default)]
+    pub(crate) iso_3166_1: String,
 }
 
 impl TmdbAltTitles {
+    /// Was this list decoded with markets? TMDB stamps `iso_3166_1` on every
+    /// AKA, so a non-empty list where none carries one is a pre-market cache
+    /// entry. An empty list is complete ("fetched, no AKAs").
+    pub(crate) fn has_markets(&self) -> bool {
+        let mut titles = self.results.iter().chain(self.titles.iter()).peekable();
+        titles.peek().is_none() || titles.any(|t| !t.iso_3166_1.is_empty())
+    }
+
     /// The non-empty AKA titles across both the TV (`results`) and movie
-    /// (`titles`) shapes.
+    /// (`titles`) shapes, **English-market (`US`, `GB`) titles first**, TMDB's
+    /// order otherwise. The relevance guard only asks "any of these?", so the
+    /// order is free for it; it matters to the search-term AKA pick
+    /// (`card::search_aka`), where `3 percent` (US) must beat `3 Pourcent` (FR).
     pub(crate) fn all(&self) -> Vec<String> {
-        self.results
-            .iter()
-            .chain(self.titles.iter())
-            .map(|t| t.title.trim().to_string())
-            .filter(|t| !t.is_empty())
+        self.entries().into_iter().map(|t| t.title).collect()
+    }
+
+    /// [`Self::all`] with each AKA's market kept — same order, same filtering
+    /// (titles trimmed, blanks dropped).
+    pub(crate) fn entries(&self) -> Vec<TmdbAltTitle> {
+        let mut titles: Vec<&TmdbAltTitle> = self.results.iter().chain(self.titles.iter()).collect();
+        titles.sort_by_key(|t| !matches!(t.iso_3166_1.as_str(), "US" | "GB"));
+        titles
+            .into_iter()
+            .map(|t| TmdbAltTitle {
+                title: t.title.trim().to_string(),
+                iso_3166_1: t.iso_3166_1.trim().to_string(),
+            })
+            .filter(|t| !t.title.is_empty())
             .collect()
     }
 }
@@ -748,6 +939,9 @@ pub(crate) struct TmdbMovieDetails {
     pub(crate) poster_path: Option<String>,
     #[serde(default)]
     pub(crate) alternative_titles: Option<TmdbAltTitles>,
+    /// See [`TmdbTvDetails::images`].
+    #[serde(default)]
+    pub(crate) images: Option<TmdbImages>,
 }
 
 impl TmdbMovieDetails {
@@ -762,6 +956,12 @@ impl TmdbMovieDetails {
             .as_ref()
             .map(TmdbAltTitles::all)
             .unwrap_or_default();
+        let akas = self
+            .alternative_titles
+            .as_ref()
+            .map(TmdbAltTitles::entries)
+            .unwrap_or_default();
+        let posters = self.images.map(|i| i.posters).unwrap_or_default();
         TmdbHit {
             tmdbid: self.id,
             title: self.title.unwrap_or_else(|| "(untitled)".to_string()),
@@ -772,6 +972,8 @@ impl TmdbMovieDetails {
             poster_path: self.poster_path,
             genre_ids: Vec::new(),
             alt_titles,
+            akas,
+            posters,
         }
     }
 }

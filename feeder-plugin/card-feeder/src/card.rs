@@ -17,11 +17,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use meta_feeder_sdk::hash::compute_card_cid;
+use meta_feeder_sdk::hash::{compute_card_cid, compute_url_cid};
 use meta_feeder_sdk::types::DiscoveryRecord;
 
 use crate::consts::MAX_CARD_SEASONS;
-use crate::tmdb_client::{TmdbClient, TmdbKind, TmdbSeasonSummary};
+use crate::tmdb_client::{
+    iso639_1_to_3, norm_tokens, normalize_title_name, title_member_key, TmdbClient, TmdbImage,
+    TmdbKind, TmdbSeasonSummary,
+};
 
 /// The metadata source that published a card. One variant per bridge; the
 /// string form is the CID's source namespace, so **changing it re-mints every
@@ -65,14 +68,17 @@ pub(crate) struct Card {
     pub(crate) title: String,
     /// Canonical + original + AKA titles. Rides along so the *content* feeders
     /// can run their resemblance guard against the card instead of re-querying
-    /// TMDB for it.
+    /// TMDB for it (phase 2, once the indexer feeder's own anchor resolution is
+    /// retired).
     ///
-    /// Not read here yet — it is consumed by phase 2, which still resolves its
-    /// own anchor until the indexer feeder's `build_anchor_record` path is
-    /// retired. Resolving it now means the card is already complete when that
-    /// switch happens.
-    #[allow(dead_code)]
+    /// Read here for one thing: picking `searchTitle` ([`search_aka`]).
     pub(crate) guard_titles: Arc<Vec<String>>,
+    /// Every name of the work as `(lang3, name)`, filed on the record as the
+    /// `titles/{lang3}/{name}` key-set (METADATA_KEYS.md). Built by
+    /// `tmdb_client::title_names`: original under its language, `title` under
+    /// `eng` when it differs, AKAs by market. Same names as `guard_titles`, with
+    /// the language each is written in.
+    pub(crate) names: Vec<(&'static str, String)>,
     pub(crate) overview: Option<String>,
     pub(crate) poster_path: Option<String>,
     /// Editorial genre names (`"Animation"`, `"Drama"`, …) — METADATA_KEYS
@@ -98,6 +104,11 @@ pub(crate) struct Card {
     /// from a mutated series card.
     #[allow(dead_code)]
     pub(crate) season_summaries: Arc<Vec<TmdbSeasonSummary>>,
+
+    /// Poster candidates (TMDB `images.posters`), filed as the
+    /// `posters/{lang3}/{cid}` key-set by [`poster_member_keys`]. Only the by-id
+    /// path has them; discovery/search cards leave this empty and file no set.
+    pub(crate) posters: Arc<Vec<TmdbImage>>,
 }
 
 impl Card {
@@ -198,6 +209,23 @@ impl Card {
             fields.insert("workForm".to_string(), work_form.to_string());
         }
         fields.insert("title".to_string(), self.title.clone());
+        // The keyword a consumer should search indexers with, only when `title`
+        // itself can't be searched (`3%` → `3 percent`). meta-watch's title page
+        // has no TMDB access of its own and reads this off the card; without it
+        // its free-text query sends `3%`, which one newznab answers with nothing
+        // and another floods with every release containing a `3`.
+        if let Some(aka) = search_aka(&self.title, self.guard_titles.iter()) {
+            // Normalised like a `titles/*/*` member name: `searchTitle` is always
+            // one of the record's names, spelled the same way.
+            fields.insert("searchTitle".to_string(), normalize_title_name(aka));
+        }
+        // Every name the work is known by, as the language-nested key-set. A
+        // key-set so two peers resolving different AKAs union on key-merge.
+        for (lang3, name) in &self.names {
+            if let Some(key) = title_member_key(lang3, name) {
+                fields.insert(key, "true".to_string());
+            }
+        }
 
         // The id bag.
         if let Some(id) = self.tmdbid {
@@ -271,6 +299,15 @@ impl Card {
             "poster_url".to_string(),
             tmdb.poster_cdn_url(poster_path),
         );
+        // The alternative posters, as the language-nested key-set (METADATA_KEYS
+        // §6 `posters/{lang3}/{cid}`). Every member is a `url` locator, so listing
+        // them costs no fetch. The primary member wraps the exact `poster_url`
+        // string above: the gateway matches on it and renames the member to the
+        // content cid it seeds into `poster` — that is how "`poster` is a member"
+        // holds for a feeder card.
+        for key in poster_member_keys(tmdb, poster_path, &self.posters) {
+            fields.insert(key, "true".to_string());
+        }
 
         for (key, allowed) in query_filters {
             // `genres` joins `languages` as an echo exclusion, for the same
@@ -299,6 +336,117 @@ impl Card {
     }
 }
 
+/// Most members a record's `posters/*` key-set may carry, the primary included
+/// (METADATA_KEYS.md §6, writer rule 1).
+pub(crate) const MAX_POSTER_MEMBERS: usize = 10;
+
+/// The `posters/{lang3}/{cid}` keys for a card: the primary poster first, then
+/// the best-voted alternatives, capped at [`MAX_POSTER_MEMBERS`]. Empty when
+/// TMDB returned no image list — without one the primary's language is unknown,
+/// and a set is better absent than mislabelled.
+///
+/// Ranked by `vote_average`, then `vote_count`, then `file_path`, the last so
+/// two peers holding the same payload emit the same keys. The language is that
+/// of the text printed on the poster: `zxx` for a textless one (TMDB `null`),
+/// `und` for a code outside [`iso639_1_to_3`] or a primary TMDB did not list.
+///
+/// CROSS-BINARY CONTRACT: same ranking, cap, CDN size and language rule as the
+/// tmdb plugin's `posterMembers` (`metamesh-plugin-tmdb/src/posters.ts`).
+pub(crate) fn poster_member_keys(
+    tmdb: &TmdbClient,
+    primary_path: &str,
+    candidates: &[TmdbImage],
+) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let lang3 = |img: &TmdbImage| -> &'static str {
+        match img.iso_639_1.as_deref().map(str::trim) {
+            None | Some("") => "zxx",
+            Some(code) => iso639_1_to_3(code).unwrap_or("und"),
+        }
+    };
+    let mut keys: Vec<String> = Vec::new();
+    let primary_lang = candidates
+        .iter()
+        .find(|img| img.file_path == primary_path)
+        .map_or("und", lang3);
+    if let Some(cid) = compute_url_cid(&tmdb.poster_cdn_url(primary_path)) {
+        keys.push(format!("posters/{primary_lang}/{cid}"));
+    }
+    let mut ranked: Vec<&TmdbImage> = candidates
+        .iter()
+        .filter(|img| !img.file_path.trim().is_empty() && img.file_path != primary_path)
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.vote_average
+            .total_cmp(&a.vote_average)
+            .then(b.vote_count.cmp(&a.vote_count))
+            .then(a.file_path.cmp(&b.file_path))
+    });
+    for img in ranked {
+        if keys.len() >= MAX_POSTER_MEMBERS {
+            break;
+        }
+        if let Some(cid) = compute_url_cid(&tmdb.poster_cdn_url(&img.file_path)) {
+            let key = format!("posters/{}/{cid}", lang3(img));
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Punctuation keyword searches fold to a space. Only used to *exclude* these
+/// from [`is_search_hostile_symbol`] — a folded character searches fine.
+///
+/// CROSS-BINARY CONTRACT: identical to the indexer feeder's
+/// `torznab/mod.rs::KEYWORD_PUNCTUATION`, and to meta-watch's
+/// `clean_title` + `sanitize_free_text` sets combined.
+const KEYWORD_PUNCTUATION: [char; 11] = ['.', '_', ':', ';', ',', '-', '/', '(', ')', '=', '!'];
+
+/// An ASCII symbol an indexer's search box can neither carry nor safely lose
+/// (`%` in `3%`): punctuation outside [`KEYWORD_PUNCTUATION`], apostrophe
+/// excepted. See the indexer feeder's `is_search_hostile_symbol` for the
+/// measurements.
+///
+/// CROSS-BINARY CONTRACT: same rule as the indexer feeder's
+/// `torznab/mod.rs::is_search_hostile_symbol` and meta-watch's
+/// `catalog::query::has_search_hostile_symbol`.
+fn is_search_hostile_symbol(c: char) -> bool {
+    c.is_ascii_punctuation() && c != '\'' && !KEYWORD_PUNCTUATION.contains(&c)
+}
+
+/// The AKA to search with in place of `title` — the card's `searchTitle`.
+/// `None` unless `title` carries a [search-hostile symbol](is_search_hostile_symbol)
+/// **and** an AKA is symbol-free and strictly more specific (all of the title's
+/// word tokens, plus at least one): `3 percent` for `3%`, never the bare `3`.
+/// First qualifying AKA wins; `TmdbAltTitles::all` orders English markets first.
+///
+/// CROSS-BINARY CONTRACT: mirrors the indexer feeder's
+/// `torznab/mod.rs::search_aka`, which picks the anchored jobs' `q=` the same
+/// way. Change both.
+pub(crate) fn search_aka<'a>(
+    title: &str,
+    akas: impl IntoIterator<Item = &'a String>,
+) -> Option<&'a str> {
+    if !title.chars().any(is_search_hostile_symbol) {
+        return None;
+    }
+    let want = norm_tokens(title);
+    if want.is_empty() {
+        return None;
+    }
+    akas.into_iter()
+        .filter(|aka| !aka.chars().any(is_search_hostile_symbol))
+        .find(|aka| {
+            let have = norm_tokens(aka);
+            have.len() > want.len() && want.iter().all(|w| have.contains(w))
+        })
+        .map(String::as_str)
+}
+
 /// Split a card `record_id` (`"tmdb:tv:95479"`) back into `(source, source_id)`
 /// — the two halves of the CID preimage. `None` when the id carries no source
 /// prefix.
@@ -320,12 +468,18 @@ mod tests {
             imdb_id: Some("tt22248376".to_string()),
             title: "Frieren: Beyond Journey's End".to_string(),
             guard_titles: Arc::new(vec!["Sousou no Frieren".to_string()]),
+            names: vec![
+                ("jpn", "葬送のフリーレン".to_string()),
+                ("eng", "Frieren: Beyond Journey's End".to_string()),
+                ("jpn", "Sousou no Frieren".to_string()),
+            ],
             overview: Some("The story follows the elf mage Frieren.".to_string()),
             poster_path: Some("/dqZENchTd7lp5zit1Q7Bkjzcxpi.jpg".to_string()),
             genres: vec!["Animation".to_string(), "Sci-Fi & Fantasy".to_string()],
             year: Some(2023),
             seasons: 1,
             season_summaries: Arc::new(Vec::new()),
+            posters: Arc::new(Vec::new()),
         }
     }
 
@@ -394,6 +548,102 @@ mod tests {
         assert!(no_overview.to_record(&tmdb, &BTreeMap::new()).is_none());
     }
 
+    /// `3%` (TMDB tv 68467): the card spells the symbol out for searchers, and
+    /// keeps the real title for display.
+    #[test]
+    fn symbol_title_card_carries_a_search_title() {
+        let tmdb = TmdbClient::new("token".to_string());
+        let mut card = tv_card();
+        card.title = "3%".to_string();
+        card.guard_titles = Arc::new(
+            ["3%", "3 %", "3", "Three Percent", "3 percent", "3 Pourcent"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let rec = card.to_record(&tmdb, &BTreeMap::new()).expect("record");
+        assert_eq!(rec.fields["title"], "3%");
+        assert_eq!(rec.fields.get("searchTitle").map(String::as_str), Some("3 percent"));
+        // A searchable title gets no searchTitle — Frieren's apostrophe and
+        // colon are not hostile.
+        let rec = tv_card().to_record(&tmdb, &BTreeMap::new()).expect("record");
+        assert!(!rec.fields.contains_key("searchTitle"));
+    }
+
+    #[test]
+    fn record_files_every_name_as_a_language_nested_key_set() {
+        let tmdb = TmdbClient::new("token".to_string());
+        let rec = tv_card().to_record(&tmdb, &BTreeMap::new()).expect("record");
+        for key in [
+            "titles/jpn/葬送のフリーレン",
+            "titles/eng/Frieren: Beyond Journey's End",
+            "titles/jpn/Sousou no Frieren",
+        ] {
+            assert_eq!(rec.fields.get(key).map(String::as_str), Some("true"), "{key}");
+        }
+        // Leaves only: no scalar at the language level.
+        assert!(!rec.fields.keys().any(|k| k.starts_with("titles/") && k.matches('/').count() == 1));
+    }
+
+    /// The METADATA_KEYS.md example, end to end from TMDB's data.
+    #[test]
+    fn title_names_match_the_three_percent_example() {
+        use crate::tmdb_client::{title_names, TmdbAltTitle};
+        let aka = |m: &str, t: &str| TmdbAltTitle { title: t.to_string(), iso_3166_1: m.to_string() };
+        let names = title_names(
+            "3%",
+            Some("3%"),
+            Some("pt"),
+            &[aka("US", "3 Percent"), aka("FR", "3 Pourcent"), aka("BR", "3%"), aka("CA", "3 Por  Cento ")],
+        );
+        assert_eq!(
+            names,
+            vec![
+                ("por", "3%".to_string()),
+                ("eng", "3 Percent".to_string()),
+                ("fra", "3 Pourcent".to_string()),
+                ("und", "3 Por Cento".to_string()),
+            ],
+            "title == original is filed once; BR `3%` repeats por/3%; CA is multilingual → und"
+        );
+        // A translated title is filed under eng beside the original.
+        let names = title_names("Naruto", Some("ナルト"), Some("ja"), &[]);
+        assert_eq!(names, vec![("jpn", "ナルト".to_string()), ("eng", "Naruto".to_string())]);
+        // Unknown original language → und; TMDB's placeholder is not a name.
+        assert_eq!(title_names("(untitled)", Some("X"), Some("xx"), &[]), vec![("und", "X".to_string())]);
+    }
+
+    #[test]
+    fn title_member_key_normalises_like_two_peers_must() {
+        assert_eq!(title_member_key("jpn", "Fate/Zero").as_deref(), Some("titles/jpn/Fate\u{2215}Zero"));
+        assert_eq!(title_member_key("eng", "  3   Percent ").as_deref(), Some("titles/eng/3 Percent"));
+        assert_eq!(title_member_key("eng", "Pokémon").as_deref(), Some("titles/eng/Pokémon"));
+        assert_eq!(title_member_key("eng", "   "), None);
+    }
+
+    #[test]
+    fn search_aka_never_picks_something_weaker() {
+        let akas = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(search_aka("M*A*S*H", akas(&["MASH"]).iter()), None);
+        assert_eq!(search_aka("3%", akas(&["3", "3 %"]).iter()), None);
+        assert_eq!(search_aka("Law & Order", akas(&["Law and Order"]).iter()), Some("Law and Order"));
+        assert_eq!(search_aka("Naruto", akas(&["Naruto Shippuden"]).iter()), None);
+    }
+
+    #[test]
+    fn tmdb_alt_titles_put_english_markets_first() {
+        let alt: crate::tmdb_client::TmdbAltTitles = serde_json::from_str(
+            r#"{"results":[{"iso_3166_1":"FR","title":"3 Pourcent"},{"iso_3166_1":"US","title":"3 percent"},{"title":"no market"}]}"#,
+        )
+        .expect("decode");
+        assert_eq!(alt.all(), vec!["3 percent", "3 Pourcent", "no market"]);
+        assert!(alt.has_markets());
+        let legacy: crate::tmdb_client::TmdbAltTitles =
+            serde_json::from_str(r#"{"results":[{"title":"3 Pourcent"},{"title":"3 percent"}]}"#).expect("decode");
+        assert!(!legacy.has_markets(), "a pre-market cache entry must refetch");
+        assert!(crate::tmdb_client::TmdbAltTitles::default().has_markets(), "no AKAs is complete");
+    }
+
     #[test]
     fn movie_card_uses_the_movie_content_kind() {
         let mut card = tv_card();
@@ -430,5 +680,101 @@ mod tests {
         );
         assert_eq!(rec.fields["genres/Animation"], "true");
         assert_eq!(rec.fields["genres/Sci-Fi & Fantasy"], "true");
+    }
+
+    fn img(path: &str, lang: Option<&str>, avg: f64, count: u32) -> TmdbImage {
+        TmdbImage {
+            file_path: path.to_string(),
+            iso_639_1: lang.map(str::to_string),
+            vote_average: avg,
+            vote_count: count,
+        }
+    }
+
+    /// METADATA_KEYS §6 `posters/{lang3}/{cid}`: the primary is a member, filed
+    /// under its own language, as the locator of the exact `poster_url` the
+    /// gateway seeds — that equality is what lets the gateway rename it.
+    #[test]
+    fn record_files_the_primary_poster_as_a_locator_member() {
+        let tmdb = TmdbClient::new("token".to_string());
+        let mut card = tv_card();
+        let primary = card.poster_path.clone().expect("fixture poster");
+        card.posters = Arc::new(vec![
+            img("/alt-fr.jpg", Some("fr"), 5.5, 10),
+            img(&primary, Some("ja"), 5.0, 3),
+            img("/textless.jpg", None, 6.0, 1),
+        ]);
+        let rec = card.to_record(&tmdb, &BTreeMap::new()).expect("record");
+
+        let primary_cid = compute_url_cid(&rec.fields["poster_url"]).expect("locator");
+        assert_eq!(
+            rec.fields.get(&format!("posters/jpn/{primary_cid}")).map(String::as_str),
+            Some("true")
+        );
+        let fr = compute_url_cid(&tmdb.poster_cdn_url("/alt-fr.jpg")).expect("locator");
+        let textless = compute_url_cid(&tmdb.poster_cdn_url("/textless.jpg")).expect("locator");
+        assert!(rec.fields.contains_key(&format!("posters/fra/{fr}")));
+        assert!(rec.fields.contains_key(&format!("posters/zxx/{textless}")));
+        let members = rec.fields.keys().filter(|k| k.starts_with("posters/")).count();
+        assert_eq!(members, 3, "the primary is listed once, not twice");
+        // Leaves only, and never a 639-2/B code.
+        assert!(!rec.fields.keys().any(|k| k.starts_with("posters/") && k.matches('/').count() != 2));
+        assert!(!rec.fields.keys().any(|k| k.starts_with("posters/fre/")));
+    }
+
+    #[test]
+    fn poster_members_rank_by_votes_and_cap_at_ten() {
+        let tmdb = TmdbClient::new("token".to_string());
+        let candidates: Vec<TmdbImage> = (0..15)
+            .map(|i| img(&format!("/p{i:02}.jpg"), Some("en"), f64::from(i), 1))
+            .collect();
+        let keys = poster_member_keys(&tmdb, "/primary.jpg", &candidates);
+        assert_eq!(keys.len(), MAX_POSTER_MEMBERS);
+        // Primary first; TMDB didn't list it among its images, so `und`.
+        let primary = compute_url_cid(&tmdb.poster_cdn_url("/primary.jpg")).expect("locator");
+        assert_eq!(keys[0], format!("posters/und/{primary}"));
+        // Then the best vote_average: p14, p13, … p06 — p05 is cut.
+        let best = compute_url_cid(&tmdb.poster_cdn_url("/p14.jpg")).expect("locator");
+        assert_eq!(keys[1], format!("posters/eng/{best}"));
+        let cut = compute_url_cid(&tmdb.poster_cdn_url("/p05.jpg")).expect("locator");
+        assert!(!keys.contains(&format!("posters/eng/{cut}")));
+        // vote_count breaks a vote_average tie.
+        let tie = poster_member_keys(
+            &tmdb,
+            "/primary.jpg",
+            &[img("/few.jpg", None, 5.0, 1), img("/many.jpg", None, 5.0, 9)],
+        );
+        let many = compute_url_cid(&tmdb.poster_cdn_url("/many.jpg")).expect("locator");
+        assert_eq!(tie[1], format!("posters/zxx/{many}"));
+        // An unmapped language is `und`, never a 2-letter key.
+        let odd = poster_member_keys(&tmdb, "/primary.jpg", &[img("/x.jpg", Some("xx"), 1.0, 1)]);
+        assert!(odd[1].starts_with("posters/und/"), "{odd:?}");
+    }
+
+    /// No image list (a discovery hit, a pre-append cache entry): no set at all,
+    /// rather than a primary filed under a guessed `und`.
+    #[test]
+    fn card_without_an_image_list_files_no_poster_set() {
+        let tmdb = TmdbClient::new("token".to_string());
+        let rec = tv_card().to_record(&tmdb, &BTreeMap::new()).expect("record");
+        assert!(rec.fields.contains_key("poster_url"), "poster itself is unaffected");
+        assert!(!rec.fields.keys().any(|k| k.starts_with("posters/")));
+    }
+
+    #[test]
+    fn tmdb_images_append_decodes() {
+        let d: crate::tmdb_client::TmdbTvDetails = serde_json::from_str(
+            r#"{"name":"X","images":{"posters":[{"file_path":"/a.jpg","iso_639_1":null,"vote_average":5.3,"vote_count":4},{"file_path":"/b.jpg","iso_639_1":"fr","vote_average":0}]}}"#,
+        )
+        .expect("decode");
+        let posters = d.images.expect("images").posters;
+        assert_eq!(posters.len(), 2);
+        assert_eq!(posters[0].iso_639_1, None);
+        assert_eq!(posters[1].iso_639_1.as_deref(), Some("fr"));
+        assert_eq!(posters[1].vote_count, 0);
+        // A pre-append cache entry still decodes, with no image list.
+        let old: crate::tmdb_client::TmdbTvDetails =
+            serde_json::from_str(r#"{"name":"X"}"#).expect("decode");
+        assert!(old.images.is_none());
     }
 }

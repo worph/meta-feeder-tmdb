@@ -22,7 +22,8 @@ use crate::consts::{
 };
 use crate::tmdb_budget::{Lease, TmdbBudget};
 use crate::tmdb_client::{
-    principal_top_n, TmdbCall, TmdbClient, TmdbExternalIds, TmdbHit, TmdbKind, TmdbTvDetails,
+    principal_top_n, title_names, TmdbAltTitles, TmdbCall, TmdbClient, TmdbExternalIds, TmdbHit,
+    TmdbKind, TmdbTvDetails,
 };
 
 /// TMDB resolution with a persistent cache in front and a token budget behind.
@@ -149,7 +150,11 @@ impl Resolver {
         if let Ok(Some(json)) = self.cache.get_tmdb_moviedetails(&key) {
             if json != "null" {
                 if let Ok(hit) = serde_json::from_str::<TmdbHit>(&json) {
-                    return Some(hit);
+                    // Self-heal: AKAs cached without their markets can't be
+                    // filed under `titles/{lang3}/{name}` — refetch once.
+                    if hit.alt_titles.is_empty() || !hit.akas.is_empty() {
+                        return Some(hit);
+                    }
                 }
             }
         }
@@ -265,7 +270,18 @@ impl Resolver {
                     .as_deref()
                     .and_then(|d| d.get(0..4))
                     .and_then(|y| y.parse::<u16>().ok());
+                let names = title_names(
+                    &details.name,
+                    details.original_name.as_deref(),
+                    details.original_language.as_deref(),
+                    &details
+                        .alternative_titles
+                        .as_ref()
+                        .map(TmdbAltTitles::entries)
+                        .unwrap_or_default(),
+                );
                 Some(Card {
+                    names,
                     source: CardSource::Tmdb,
                     kind,
                     source_id: format!("tv:{tmdbid}"),
@@ -280,6 +296,13 @@ impl Resolver {
                     year,
                     seasons: Card::clamp_seasons(details.number_of_seasons),
                     season_summaries: Arc::new(details.seasons.clone()),
+                    posters: Arc::new(
+                        details
+                            .images
+                            .as_ref()
+                            .map(|i| i.posters.clone())
+                            .unwrap_or_default(),
+                    ),
                 })
             }
             TmdbKind::Movie => {
@@ -298,7 +321,14 @@ impl Resolver {
                     titles.push(o.clone());
                 }
                 titles.extend(hit.alt_titles.iter().cloned());
+                let names = title_names(
+                    &hit.title,
+                    hit.original_title.as_deref(),
+                    hit.original_language.as_deref(),
+                    &hit.akas,
+                );
                 Some(Card {
+                    names,
                     source: CardSource::Tmdb,
                     kind,
                     source_id: format!("movie:{tmdbid}"),
@@ -313,6 +343,7 @@ impl Resolver {
                     year: hit.year,
                     seasons: 0,
                     season_summaries: Arc::new(Vec::new()),
+                    posters: Arc::new(hit.posters),
                 })
             }
         }
