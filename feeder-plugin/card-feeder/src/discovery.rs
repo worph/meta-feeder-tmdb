@@ -77,6 +77,15 @@ pub(crate) enum DiscoveryMode {
     Popular,
     Trending,
     TopRated,
+    /// What came out **today** — the day-by-day row. TV: shows with an episode
+    /// airing today; film: releases from the last fortnight.
+    ///
+    /// Date-bounded rather than availability-bounded on purpose. "Is a file out
+    /// yet" is an indexer question, and asking it per show per day is exactly
+    /// the load that wedges a Prowlarr; an air date is a fact TMDB already
+    /// holds, costs the same single call as every other row, and makes the row
+    /// roll over by itself at midnight with nothing scheduled.
+    Airing,
 }
 
 impl DiscoveryMode {
@@ -94,6 +103,7 @@ impl DiscoveryMode {
             DiscoveryMode::Popular => "popular",
             DiscoveryMode::Trending => "trending",
             DiscoveryMode::TopRated => "top_rated",
+            DiscoveryMode::Airing => "airing",
         }
     }
 
@@ -103,7 +113,11 @@ impl DiscoveryMode {
     fn discover_sort(self) -> &'static str {
         match self {
             DiscoveryMode::TopRated => "vote_average.desc",
-            DiscoveryMode::Popular | DiscoveryMode::Trending => "popularity.desc",
+            // Airing sorts by popularity too: the date bound is what selects the
+            // row, so the sort only decides who leads it.
+            DiscoveryMode::Popular | DiscoveryMode::Trending | DiscoveryMode::Airing => {
+                "popularity.desc"
+            }
         }
     }
 }
@@ -124,6 +138,10 @@ pub(crate) fn is_discovery_query(query: &GatewayQuery) -> bool {
 /// First truthy mode marker on the query, in precedence order.
 fn discovery_mode(query: &GatewayQuery) -> Option<DiscoveryMode> {
     for mode in [
+        // Airing leads: it is the most specific claim a row can make, and a
+        // caller that sends `airing:true popular:true` means "today's, by
+        // popularity", not "popular, ever".
+        DiscoveryMode::Airing,
         DiscoveryMode::Trending,
         DiscoveryMode::Popular,
         DiscoveryMode::TopRated,
@@ -203,6 +221,63 @@ fn with_genres_ids(wanted: &[String], names: &HashMap<u32, String>) -> Vec<u32> 
     ids
 }
 
+/// How far back the film side of [`DiscoveryMode::Airing`] reaches, in days.
+///
+/// A series airs an episode on a given day, so "today" is a real set. Films do
+/// not: a single day's releases are usually empty, and a viewer opening the app
+/// on a Tuesday still means "what's new". A fortnight is the smallest window
+/// that keeps the row populated without turning it into "this year".
+const AIRING_MOVIE_WINDOW_DAYS: i64 = 13;
+
+/// Today, UTC, as `YYYY-MM-DD` — the bound [`DiscoveryMode::Airing`] is built
+/// from. UTC rather than a local zone: the feeder serves peers in every zone,
+/// and TMDB's air dates are themselves zone-less calendar dates.
+fn today_utc_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+/// `YYYY-MM-DD` for a count of days since 1970-01-01.
+///
+/// Hand-rolled (Howard Hinnant's civil-from-days) rather than pulling in a date
+/// crate for one format call — and split from [`today_utc_days`] so the whole
+/// thing is testable against known dates instead of "whatever today is".
+fn fmt_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The `/discover` date bounds for [`DiscoveryMode::Airing`], given today.
+///
+/// TV bounds `air_date` to the single day, which is what makes the row
+/// "today's episodes" and what makes it roll over on its own. Film bounds
+/// `primary_release_date` to [`AIRING_MOVIE_WINDOW_DAYS`] back — see that
+/// constant for why the two kinds cannot share a window.
+fn airing_bounds(kind: TmdbKind, today: i64) -> String {
+    match kind {
+        TmdbKind::Tv => {
+            let d = fmt_days(today);
+            format!("air_date.gte={d}&air_date.lte={d}&")
+        }
+        TmdbKind::Movie => format!(
+            "primary_release_date.gte={}&primary_release_date.lte={}&",
+            fmt_days(today - AIRING_MOVIE_WINDOW_DAYS),
+            fmt_days(today),
+        ),
+    }
+}
+
 /// Build the `path_and_query` for `TmdbClient::discovery_list` from the mode,
 /// kind, anime flag, requested genre ids, and 1-based `page`.
 fn build_path_and_query(
@@ -244,7 +319,17 @@ fn build_path_and_query(
     // single 10.0 vote on top, which a 50-vote gate doesn't stop.
     let votes = match mode {
         DiscoveryMode::TopRated => 200,
+        // ⚠ No vote floor on the airing row, and that is the point. The shared
+        // gate exists to keep unrated residue off a popularity ranking; here the
+        // date bound already decides membership, and a floor would filter out
+        // exactly what the row is for — a series whose first season is airing
+        // now has not had time to collect 50 votes.
+        DiscoveryMode::Airing => 0,
         _ => DISCOVERY_MIN_VOTES,
+    };
+    let dates = match mode {
+        DiscoveryMode::Airing => airing_bounds(kind, today_utc_days()),
+        _ => String::new(),
     };
     let keyword = if anime {
         format!("with_keywords={TMDB_ANIME_KEYWORD}&")
@@ -266,7 +351,7 @@ fn build_path_and_query(
         format!("with_genres={joined}&")
     };
     format!(
-        "discover/{seg}?{keyword}{genres}sort_by={}&include_adult=false\
+        "discover/{seg}?{keyword}{genres}{dates}sort_by={}&include_adult=false\
          &without_keywords={DISCOVERY_EXCLUDED_KEYWORDS}&vote_count.gte={votes}&page={page}",
         mode.discover_sort(),
     )
@@ -718,5 +803,49 @@ mod tests {
         assert_eq!(tv.content_kind(), "series");
         let movie = card_from_hit(&hit(), TmdbKind::Movie, &genre_table());
         assert_eq!(movie.content_kind(), "movie");
+    }
+
+    /// The day-by-day row: what selects it, and what it asks TMDB for.
+    ///
+    /// Bounding by air date rather than by availability is the whole design —
+    /// see [`DiscoveryMode::Airing`]. These pin the three parts that make the
+    /// row roll over on its own: the date maths, the bounds per kind, and the
+    /// fact that the vote floor is lifted (a season airing now has no votes
+    /// yet, and the shared floor would empty the row it is meant to fill).
+    #[test]
+    fn airing_row_is_bounded_by_date_not_by_votes() {
+        // Date maths, against known days-since-epoch.
+        assert_eq!(fmt_days(0), "1970-01-01");
+        assert_eq!(fmt_days(19_723), "2024-01-01"); // a leap year's first day
+        assert_eq!(fmt_days(19_782), "2024-02-29"); // the leap day itself
+        assert_eq!(fmt_days(20_453), "2025-12-31");
+
+        // TV: exactly one day, so "today's episodes" is literal.
+        let tv = airing_bounds(TmdbKind::Tv, 19_723);
+        assert_eq!(tv, "air_date.gte=2024-01-01&air_date.lte=2024-01-01&");
+
+        // Film: a fortnight back, because a single day of releases is empty.
+        let movie = airing_bounds(TmdbKind::Movie, 19_723);
+        assert!(movie.contains("primary_release_date.gte=2023-12-19"), "{movie}");
+        assert!(movie.contains("primary_release_date.lte=2024-01-01"), "{movie}");
+
+        // The marker selects the mode, and outranks a co-sent `popular`.
+        assert_eq!(
+            discovery_mode(&query(&[("airing", "true"), ("popular", "true")])),
+            Some(DiscoveryMode::Airing)
+        );
+
+        // The built query carries the date bound and lifts the vote floor.
+        let url = build_path_and_query(DiscoveryMode::Airing, TmdbKind::Tv, false, &[], 1);
+        assert!(url.starts_with("discover/tv?"), "{url}");
+        assert!(url.contains("air_date.gte="), "{url}");
+        assert!(url.contains("vote_count.gte=0"), "{url}");
+        // Still gated for adult residue like every other /discover row.
+        assert!(url.contains("without_keywords="), "{url}");
+
+        // A popular row is unchanged: no date bound, floor intact.
+        let pop = build_path_and_query(DiscoveryMode::Popular, TmdbKind::Tv, false, &[], 1);
+        assert!(!pop.contains("air_date."), "{pop}");
+        assert!(pop.contains(&format!("vote_count.gte={DISCOVERY_MIN_VOTES}")), "{pop}");
     }
 }
