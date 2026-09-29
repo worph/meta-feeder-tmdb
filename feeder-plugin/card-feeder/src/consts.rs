@@ -47,6 +47,20 @@ pub(crate) const TMDB_DISCOVERY_WAIT_DEADLINE_SECS: u64 = 5;
 /// asking for 500) to a predictable per-row TMDB cost.
 pub(crate) const DISCOVERY_MAX_PAGES: u32 = 5;
 
+/// TMDB genre ids kept OUT of the date-bounded `airing` rows.
+///
+/// A row bounded by "aired today" is otherwise dominated by what airs EVERY
+/// day: late-night talk (`The Tonight Show`, `Watch What Happens Live`), the
+/// news-desk shows (`The Daily Show`), long-running soaps (`Goede Tijden,
+/// Slechte Tijden`, `Demain nous appartient`) and reality. Measured on the live
+/// row: 6 of the first 6 titles. They are legitimately airing — they are simply
+/// not what "what came out today" is asked to answer, and they crowd out the
+/// drama that airs weekly.
+///
+/// 10764 Reality · 10767 Talk · 10763 News · 10766 Soap.
+/// Drop an id from this list to let that genre back into the row.
+pub(crate) const AIRING_EXCLUDED_GENRES: &str = "10764,10767,10763,10766";
+
 /// TMDB keyword ids excluded from an `anime:true` discovery row, as
 /// `without_keywords`: `hentai`, `softcore`, `erotica`, `pornography`,
 /// `adult animation`.

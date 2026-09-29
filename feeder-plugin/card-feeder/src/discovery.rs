@@ -58,7 +58,9 @@ use meta_feeder_sdk::plugin::GatewayQuery;
 use tracing::debug;
 
 use crate::card::{Card, CardSource};
-use crate::consts::{DISCOVERY_EXCLUDED_KEYWORDS, DISCOVERY_MAX_PAGES, DISCOVERY_MIN_VOTES};
+use crate::consts::{
+    AIRING_EXCLUDED_GENRES, DISCOVERY_EXCLUDED_KEYWORDS, DISCOVERY_MAX_PAGES, DISCOVERY_MIN_VOTES,
+};
 use crate::resolve::{dedup_titles, Resolver};
 use crate::tmdb_client::{title_names, TmdbHit, TmdbKind};
 
@@ -268,7 +270,14 @@ fn airing_bounds(kind: TmdbKind, today: i64) -> String {
     match kind {
         TmdbKind::Tv => {
             let d = fmt_days(today);
-            format!("air_date.gte={d}&air_date.lte={d}&")
+            // ⚠ `without_genres` rides with the date bound, and only here. A row
+            // of "aired today" is otherwise the daily-broadcast schedule — talk,
+            // news, soap, reality — which is exactly what the viewer did not
+            // mean. See [`AIRING_EXCLUDED_GENRES`]. The other modes keep every
+            // genre: a *popular* row has no reason to hide a talk show.
+            format!(
+                "air_date.gte={d}&air_date.lte={d}&without_genres={AIRING_EXCLUDED_GENRES}&"
+            )
         }
         TmdbKind::Movie => format!(
             "primary_release_date.gte={}&primary_release_date.lte={}&",
@@ -822,7 +831,15 @@ mod tests {
 
         // TV: exactly one day, so "today's episodes" is literal.
         let tv = airing_bounds(TmdbKind::Tv, 19_723);
-        assert_eq!(tv, "air_date.gte=2024-01-01&air_date.lte=2024-01-01&");
+        assert!(tv.starts_with("air_date.gte=2024-01-01&air_date.lte=2024-01-01&"), "{tv}");
+        // The daily-broadcast genres are excluded from this row, and only this
+        // row — a talk show airs every day and would otherwise fill it.
+        assert!(tv.contains(&format!("without_genres={AIRING_EXCLUDED_GENRES}")), "{tv}");
+        assert!(
+            !build_path_and_query(DiscoveryMode::Popular, TmdbKind::Tv, false, &[], 1)
+                .contains("without_genres"),
+            "a popular row must keep every genre"
+        );
 
         // Film: a fortnight back, because a single day of releases is empty.
         let movie = airing_bounds(TmdbKind::Movie, 19_723);
