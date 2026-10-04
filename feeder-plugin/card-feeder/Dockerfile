@@ -2,8 +2,8 @@
 # =============================================================================
 # card-feeder — metadata-bridge feeder sidecar (the card tier). Multi-stage.
 #
-# The build context must be the REPO ROOT (the workspace) so the
-# `meta-feeder-sdk` path dependency (../../crates/meta-feeder-sdk) resolves.
+# The build context must be the REPO ROOT (the workspace). `meta-feeder-sdk` is
+# a git dependency pinned by tag (no vendored copy any more), fetched by cargo.
 # Same BuildKit cache-mount strategy as the other feeders: the cargo
 # registry/git and `target/` persist across builds; the release binary is
 # copied OUT of the target cache mount within the same RUN.
@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml rust-toolchain.toml ./
 COPY Cargo.lock* ./
-COPY crates/ crates/
 COPY feeder-plugin/ feeder-plugin/
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \

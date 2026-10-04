@@ -70,7 +70,7 @@ first boot; the config file wins from then on. No hot reload — bounce the feed
 cargo build --release --bin card-feeder
 cargo test -p card-feeder
 
-# Image (build context is the repo root so the vendored SDK path dep resolves)
+# Image (build context is the repo root, the workspace)
 docker build -f feeder-plugin/card-feeder/Dockerfile -t ghcr.io/worph/meta-feeder-card:dev .
 ```
 
@@ -84,7 +84,6 @@ Register it with a gateway by adding it to that gateway's `gateway-config.json`
 ## Layout
 
 ```
-crates/meta-feeder-sdk/        vendored SDK copy (mirrored from meta-gateway)
 feeder-plugin/card-feeder/
   src/tmdb.rs                  the FeederPlugin impl — routing + query + outcomes
   src/card.rs                  the Card model + its DiscoveryRecord projection

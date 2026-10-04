@@ -22,7 +22,7 @@ name = "card-feeder"
 path = "src/main.rs"
 
 [dependencies]
-meta-feeder-sdk = { path = "../../crates/meta-feeder-sdk" }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.7.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
